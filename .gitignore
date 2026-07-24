@@ -42,3 +42,9 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# sqlite database files
+*.sqlite
+
+# everything in the sandbox directory
+sandbox/
