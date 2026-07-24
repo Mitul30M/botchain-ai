@@ -48,4 +48,4 @@ Thumbs.db
 
 # everything in the sandbox & memory directory
 sandbox/
-memory/
+memory/checkpoints.*
