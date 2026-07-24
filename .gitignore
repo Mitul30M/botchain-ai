@@ -46,5 +46,6 @@ Thumbs.db
 # sqlite database files
 *.sqlite
 
-# everything in the sandbox directory
+# everything in the sandbox & memory directory
 sandbox/
+memory/
