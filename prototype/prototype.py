@@ -88,7 +88,7 @@ mcp_tools: list = []
 model = None
 checkpointer = None
 agent = None
-
+mcp_client: MultiServerMCPClient | None = None
 
 # --- Prompts and agent framework (sync, safe at module level) ---
 from prompts.system_prompt import SYSTEM_PROMPT
@@ -103,13 +103,13 @@ backend = FilesystemBackend(root_dir=str(SANDBOX_DIR), virtual_mode=True)
 
 
 # ---------------------------------------------------------------------------
-# Async setup — must be called before chat() / approve()
+# Async setup helpers — called from setup_agent()
 # ---------------------------------------------------------------------------
 
-async def _setup_mcp_client():
-    """Connect to n8n-mcp and load tool definitions."""
-    from langchain_mcp_adapters.client import MultiServerMCPClient
 
+async def _setup_mcp_client():
+    """Create the MCP client and store it globally."""
+    global mcp_client
     mcp_client = MultiServerMCPClient({
         "n8n-mcp": {
             "transport": "stdio",
@@ -119,16 +119,11 @@ async def _setup_mcp_client():
                 "MCP_MODE": "stdio",
                 "LOG_LEVEL": "error",
                 "DISABLE_CONSOLE_OUTPUT": "true",
-                "N8N_API_URL": "https://your-n8n-instance.com",
-                "N8N_API_KEY": os.getenv("N8N_API_KEY"),
+                "N8N_API_URL": os.getenv("N8N_API_URL") or "http://localhost:5678",
+                "N8N_API_KEY": os.getenv("N8N_API_KEY") or "",
             },
         }
     })
-    tools = await mcp_client.get_tools()
-    print(f"Loaded {len(tools)} tools from n8n-mcp:")
-    for t in tools:
-        print(f"  - {t.name}")
-    return tools
 
 
 async def _setup_llm():
@@ -153,214 +148,212 @@ async def _setup_checkpointer():
     return AsyncSqliteSaver(conn)
 
 
+# ---------------------------------------------------------------------------
+# Tool and schema definitions (module-level, stateless)
+# ---------------------------------------------------------------------------
+
+
+class WriteJsonFileSchema(BaseModel):
+    file_path: str = Field(description="Path where the JSON file should be created, relative to the sandbox root.")
+    content: dict | list = Field(description="The JSON-serializable object to write (dict or list).")
+
+
+def write_json_file(file_path: str, content: dict | list) -> str:
+    """Write a JSON-serializable object to a file in the sandbox. Overwrites if it already exists."""
+    file_path = file_path.lstrip("/")
+    if file_path == "sandbox" or file_path.startswith("sandbox/"):
+        file_path = file_path[len("sandbox"):].lstrip("/")
+    target = (SANDBOX_DIR / file_path).resolve()
+    sandbox_root = SANDBOX_DIR.resolve()
+    if sandbox_root != target and sandbox_root not in target.parents:
+        raise RuntimeError(f"Path '{file_path}' escapes the sandbox directory.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(content, indent=2), encoding="utf-8")
+    return f"Updated file {file_path}"
+
+
+write_json_tool = StructuredTool.from_function(
+    name="write_json_file",
+    description="Write a JSON-serializable object (dict/list) to a file. Use this for n8n workflow JSON files.",
+    func=write_json_file,
+    args_schema=WriteJsonFileSchema,
+)
+
+MAX_VALIDATION_RETRIES = 3
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^`{3}(?:json)?\s*", "", text)
+    text = re.sub(r"\s*`{3}+$", "", text)
+    return text.strip()
+
+
+def _extract_json_from_mcp_result(raw) -> dict:
+    """Normalize MCP tool return values (str, dict, or list of content blocks) to a dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        return json.loads(raw)
+    if isinstance(raw, list):
+        for block in raw:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return json.loads(block["text"])
+            if isinstance(block, str):
+                return json.loads(block)
+        raise ValueError(f"No parseable text block found in MCP result: {raw!r}")
+    raise TypeError(f"Unexpected MCP result type: {type(raw)}")
+
+
+async def _call_validate(workflow_json: dict) -> dict:
+    """Validate a workflow using the n8n-mcp validate_workflow tool."""
+    validate_tool = next(
+        (t for t in mcp_tools if t.name == "validate_workflow"),
+        None,
+    )
+    if validate_tool is None:
+        raise RuntimeError("validate_workflow tool not found in mcp_tools")
+    raw = await validate_tool.ainvoke({"workflow": workflow_json})
+    return _extract_json_from_mcp_result(raw)
+
+
+async def _repair_workflow(workflow_json: dict, errors: list) -> dict:
+    """Ask the model to fix ONLY the reported errors, returning corrected full JSON."""
+    repair_prompt = (
+        "You are repairing a broken n8n workflow JSON. Below is the current workflow "
+        "and the validation errors it produced. Return ONLY the complete corrected "
+        "JSON object — no markdown fences, no commentary, no explanation.\n\n"
+        f"CURRENT WORKFLOW:\n{json.dumps(workflow_json, indent=2)}\n\n"
+        f"VALIDATION ERRORS:\n{json.dumps(errors, indent=2)}"
+    )
+    response = await model.ainvoke([
+        SystemMessage(content="You output only valid JSON. Never include markdown fences or prose."),
+        HumanMessage(content=repair_prompt),
+    ])
+    cleaned = _strip_code_fences(response.content)
+    return json.loads(cleaned)
+
+
+class BuildValidateSchema(BaseModel):
+    workflow_name: str = Field(description="Short kebab-case slug for this workflow, e.g. 'lead-triage-webhook-to-slack'.")
+    workflow_json: dict = Field(description="The full assembled n8n workflow as a JSON-serializable dict.")
+
+
+async def build_workflow_with_validation(workflow_name: str, workflow_json: dict) -> dict:
+    """Validate a workflow JSON against n8n-mcp's validator, self-repairing on failure.
+
+    Retries up to MAX_VALIDATION_RETRIES times. Returns a dict with status either
+    'valid' or 'failed_after_retries' — never raises for ordinary validation failures.
+    """
+    current = workflow_json
+    last_result = None
+    for attempt in range(1, MAX_VALIDATION_RETRIES + 1):
+        result = await _call_validate(current)
+        last_result = result
+        if result.get("valid"):
+            return {
+                "status": "valid",
+                "attempts": attempt,
+                "workflow_name": workflow_name,
+                "workflow_json": current,
+            }
+        errors = result.get("errors", [])
+        if attempt == MAX_VALIDATION_RETRIES:
+            break
+        try:
+            current = await _repair_workflow(current, errors)
+        except Exception as e:
+            return {
+                "status": "failed_after_retries",
+                "attempts": attempt,
+                "workflow_name": workflow_name,
+                "errors": errors,
+                "repair_error": str(e),
+            }
+    return {
+        "status": "failed_after_retries",
+        "attempts": MAX_VALIDATION_RETRIES,
+        "workflow_name": workflow_name,
+        "errors": last_result.get("errors", []) if last_result else [],
+        "workflow_json": current,
+    }
+
+
+build_validate_tool = StructuredTool.from_function(
+    name="build_workflow_with_validation",
+    description=(
+        "Validates an assembled n8n workflow JSON and self-repairs it automatically "
+        "on failure, retrying internally. Call this ONCE per workflow instead of "
+        "manually calling validate_workflow yourself."
+    ),
+    coroutine=build_workflow_with_validation,
+    args_schema=BuildValidateSchema,
+)
+
+
+class ApprovalSchema(BaseModel):
+    workflow_name: str = Field(description="Slug this workflow will be saved/deployed under.")
+    nodes_added: list[str] = Field(description="Display names of every node in the workflow.")
+    credentials_used: list[str] = Field(default_factory=list, description="Credential types referenced, e.g. 'slackApi'. Empty list if none.")
+    external_services: list[str] = Field(description="Plain-language real-world services this workflow will actually touch when active.")
+    summary: str = Field(description="1-3 plain-language sentences describing what this workflow does when it runs.")
+
+
+def request_human_approval(
+    workflow_name: str,
+    nodes_added: list[str],
+    credentials_used: list[str],
+    external_services: list[str],
+    summary: str,
+) -> str:
+    """Pause execution and ask the human to approve this workflow before it is written to disk."""
+    decision = interrupt({
+        "type": "approval_request",
+        "workflow_name": workflow_name,
+        "nodes_added": nodes_added,
+        "credentials_used": credentials_used,
+        "external_services": external_services,
+        "summary": summary,
+    })
+    approved = decision.get("approved", False) if isinstance(decision, dict) else bool(decision)
+    feedback = decision.get("feedback", "") if isinstance(decision, dict) else ""
+    if approved:
+        return "APPROVED by user. Proceed to write the workflow file with write_json_file."
+    return f"REJECTED by user. Feedback: {feedback or '(none given)'}. Do not write any file — return to PLAN or BUILD to address this."
+
+
+approval_tool = StructuredTool.from_function(
+    name="request_human_approval",
+    description="Pauses and requests explicit human approval, showing a summary of nodes/credentials/external services, before any file is written.",
+    func=request_human_approval,
+    args_schema=ApprovalSchema,
+)
+
+
+# ---------------------------------------------------------------------------
+# Agent setup
+# ---------------------------------------------------------------------------
+
+
 async def setup_agent():
     """Initialize MCP tools, the LLM, the checkpointer, and the deep agent.
 
     Must be called once before any chat() / approve() calls.
     Populates the module-level mcp_tools, model, checkpointer, and agent globals.
     """
-    global mcp_tools, model, checkpointer, agent, _mcp_session_cm, mcp_session
+    global mcp_tools, model, checkpointer, agent
 
-    mcp_client = MultiServerMCPClient({
-        "n8n-mcp": {
-            "transport": "stdio",
-            "command": "npx",
-            "args": ["n8n-mcp"],
-            "env": {
-                "MCP_MODE": "stdio",
-                "LOG_LEVEL": "error",
-                "DISABLE_CONSOLE_OUTPUT": "true",
-                "N8N_API_URL": "https://your-n8n-instance.com",
-                "N8N_API_KEY": os.getenv("N8N_API_KEY"),
-            },
-        }
-    })
-    _mcp_session_cm = mcp_client.session("n8n-mcp")
-    mcp_session = await _mcp_session_cm.__aenter__()
+    await _setup_mcp_client()
+    mcp_tools = await mcp_client.get_tools()
+    print(f"Loaded {len(mcp_tools)} tools from n8n-mcp")
 
-    from langchain_mcp_adapters.tools import load_mcp_tools
-    mcp_tools = await load_mcp_tools(mcp_session)
-    ...
     model = await _setup_llm()
     checkpointer = await _setup_checkpointer()
 
-    # --- Tools available to the agent ---
-
-    # write_json_file
-    class WriteJsonFileSchema(BaseModel):
-        file_path: str = Field(description="Path where the JSON file should be created, relative to the sandbox root.")
-        content: dict | list = Field(description="The JSON-serializable object to write (dict or list).")
-
-    def write_json_file(file_path: str, content: dict | list) -> str:
-        """Write a JSON-serializable object to a file in the sandbox. Overwrites if it already exists."""
-        file_path = file_path.lstrip("/")
-        if file_path == "sandbox" or file_path.startswith("sandbox/"):
-            file_path = file_path[len("sandbox"):].lstrip("/")
-        target = (SANDBOX_DIR / file_path).resolve()
-        sandbox_root = SANDBOX_DIR.resolve()
-        if sandbox_root != target and sandbox_root not in target.parents:
-            raise RuntimeError(f"Path '{file_path}' escapes the sandbox directory.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(content, indent=2), encoding="utf-8")
-        return f"Updated file {file_path}"
-
-    write_json_tool = StructuredTool.from_function(
-        name="write_json_file",
-        description="Write a JSON-serializable object (dict/list) to a file. Use this for n8n workflow JSON files.",
-        func=write_json_file,
-        args_schema=WriteJsonFileSchema,
-    )
-
-    # build_workflow_with_validation — validates & self-repairs n8n JSON
-    MAX_VALIDATION_RETRIES = 3
-
-    _validate_tool = next(t for t in mcp_tools if t.name == "validate_workflow")
-
-    def _strip_code_fences(text: str) -> str:
-        text = text.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        return text.strip()
-
-    def _extract_json_from_mcp_result(raw) -> dict:
-        """Normalize MCP tool return values (str, dict, or list of content blocks) to a dict."""
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            return json.loads(raw)
-        if isinstance(raw, list):
-            for block in raw:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    return json.loads(block["text"])
-                if isinstance(block, str):
-                    return json.loads(block)
-            raise ValueError(f"No parseable text block found in MCP result: {raw!r}")
-        raise TypeError(f"Unexpected MCP result type: {type(raw)}")
-
-    async def _call_validate(workflow_json: dict) -> dict:
-        """Call the MCP validate_workflow tool, tolerating minor arg-name differences."""
-        for key in ("workflow", "workflowJson", "json"):
-            try:
-                raw = await _validate_tool.ainvoke({key: workflow_json})
-                return _extract_json_from_mcp_result(raw)
-            except Exception:
-                continue
-        raise RuntimeError(
-            "Could not call validate_workflow — check its expected argument name "
-            "(inspect `_validate_tool.args_schema.schema()`) and adjust `_call_validate`."
-        )
-
-    async def _repair_workflow(workflow_json: dict, errors: list) -> dict:
-        """Ask the model to fix ONLY the reported errors, returning corrected full JSON."""
-        repair_prompt = (
-            "You are repairing a broken n8n workflow JSON. Below is the current workflow "
-            "and the validation errors it produced. Return ONLY the complete corrected "
-            "JSON object — no markdown fences, no commentary, no explanation.\n\n"
-            f"CURRENT WORKFLOW:\n{json.dumps(workflow_json, indent=2)}\n\n"
-            f"VALIDATION ERRORS:\n{json.dumps(errors, indent=2)}"
-        )
-        response = await model.ainvoke([
-            SystemMessage(content="You output only valid JSON. Never include markdown fences or prose."),
-            HumanMessage(content=repair_prompt),
-        ])
-        cleaned = _strip_code_fences(response.content)
-        return json.loads(cleaned)
-
-    class BuildValidateSchema(BaseModel):
-        workflow_name: str = Field(description="Short kebab-case slug for this workflow, e.g. 'lead-triage-webhook-to-slack'.")
-        workflow_json: dict = Field(description="The full assembled n8n workflow as a JSON-serializable dict.")
-
-    async def build_workflow_with_validation(workflow_name: str, workflow_json: dict) -> dict:
-        """Validate a workflow JSON against n8n-mcp's validator, self-repairing on failure.
-
-        Retries up to MAX_VALIDATION_RETRIES times. Returns a dict with status either
-        'valid' or 'failed_after_retries' — never raises for ordinary validation failures.
-        """
-        current = workflow_json
-        last_result = None
-        for attempt in range(1, MAX_VALIDATION_RETRIES + 1):
-            result = await _call_validate(current)
-            last_result = result
-            if result.get("valid"):
-                return {
-                    "status": "valid",
-                    "attempts": attempt,
-                    "workflow_name": workflow_name,
-                    "workflow_json": current,
-                }
-            errors = result.get("errors", [])
-            if attempt == MAX_VALIDATION_RETRIES:
-                break
-            try:
-                current = await _repair_workflow(current, errors)
-            except Exception as e:
-                return {
-                    "status": "failed_after_retries",
-                    "attempts": attempt,
-                    "workflow_name": workflow_name,
-                    "errors": errors,
-                    "repair_error": str(e),
-                }
-        return {
-            "status": "failed_after_retries",
-            "attempts": MAX_VALIDATION_RETRIES,
-            "workflow_name": workflow_name,
-            "errors": last_result.get("errors", []) if last_result else [],
-            "workflow_json": current,
-        }
-
-    build_validate_tool = StructuredTool.from_function(
-        name="build_workflow_with_validation",
-        description=(
-            "Validates an assembled n8n workflow JSON and self-repairs it automatically "
-            "on failure, retrying internally. Call this ONCE per workflow instead of "
-            "manually calling validate_workflow yourself."
-        ),
-        coroutine=build_workflow_with_validation,
-        args_schema=BuildValidateSchema,
-    )
-
-    # request_human_approval — interrupt gate before writing any file
-    class ApprovalSchema(BaseModel):
-        workflow_name: str = Field(description="Slug this workflow will be saved/deployed under.")
-        nodes_added: list[str] = Field(description="Display names of every node in the workflow.")
-        credentials_used: list[str] = Field(default_factory=list, description="Credential types referenced, e.g. 'slackApi'. Empty list if none.")
-        external_services: list[str] = Field(description="Plain-language real-world services this workflow will actually touch when active.")
-        summary: str = Field(description="1-3 plain-language sentences describing what this workflow does when it runs.")
-
-    def request_human_approval(
-        workflow_name: str,
-        nodes_added: list[str],
-        credentials_used: list[str],
-        external_services: list[str],
-        summary: str,
-    ) -> str:
-        """Pause execution and ask the human to approve this workflow before it is written to disk."""
-        decision = interrupt({
-            "type": "approval_request",
-            "workflow_name": workflow_name,
-            "nodes_added": nodes_added,
-            "credentials_used": credentials_used,
-            "external_services": external_services,
-            "summary": summary,
-        })
-        approved = decision.get("approved", False) if isinstance(decision, dict) else bool(decision)
-        feedback = decision.get("feedback", "") if isinstance(decision, dict) else ""
-        if approved:
-            return "APPROVED by user. Proceed to write the workflow file with write_json_file."
-        return f"REJECTED by user. Feedback: {feedback or '(none given)'}. Do not write any file — return to PLAN or BUILD to address this."
-
-    approval_tool = StructuredTool.from_function(
-        name="request_human_approval",
-        description="Pauses and requests explicit human approval, showing a summary of nodes/credentials/external services, before any file is written.",
-        func=request_human_approval,
-        args_schema=ApprovalSchema,
-    )
-
-    # --- Create the deep agent ---
+    all_tools = mcp_tools + [write_json_tool, build_validate_tool, approval_tool]
     agent = create_deep_agent(
         model=model,
-        tools=mcp_tools + [write_json_tool, build_validate_tool, approval_tool],
+        tools=all_tools,
         system_prompt=SYSTEM_PROMPT,
         backend=backend,
         checkpointer=checkpointer,
@@ -370,6 +363,7 @@ async def setup_agent():
 # ---------------------------------------------------------------------------
 # Streaming chat helper
 # ---------------------------------------------------------------------------
+
 
 async def _stream_response(astream_generator):
     """Stream agent response using rich Live for smooth token-by-token display."""
@@ -487,6 +481,7 @@ async def approve(thread_id: str, approved: bool, feedback: str = ""):
 # ---------------------------------------------------------------------------
 # Entry point — terminal chat loop
 # ---------------------------------------------------------------------------
+
 
 async def main():
     """Wire up the agent and run an interactive terminal chat loop."""
