@@ -50,3 +50,6 @@ Thumbs.db
 sandbox/
 
 store/
+
+# interview prep notes
+interview_answers_*.md
