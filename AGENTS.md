@@ -1,211 +1,222 @@
-BotChain AI is a web application that lets a business user describe a problem or
-process in plain language and receive back a ready-to-import n8n automation
-—
-with no knowledge of nodes, APIs, or JSON required. The system works through a
-two-phase conversational agent: a Plan phase that interviews the user to build a precise,
-structured understanding of their requirement, and a Build phase that translates that
-requirement into a validated n8n workflow file, grounded in live, authoritative node
-documentation rather than model guesswork.
-The core technical risk in any "LLM writes automation JSON" product is hallucination —
-language models are fluent but not reliable narrators of an ever-changing node schema.
-BotChain AI addresses this directly by wiring the build agent to n8n-mcp, a Model
-Context Protocol server that exposes live, structured documentation for over 1,600 n8n
-nodes, plus a workflow validation endpoint the agent calls before ever showing output to
-the user. This is the diﬀerence between an agent that recalls n8n syntax and one that
-looks it up and checks its own work — and it is the central engineering bet this proposal
-is built around.
+# BotChain AI — Backend (Python/FastAPI)
 
-Objectives
-Build a conversational agent that gathers automation requirements through natural
-dialogue and converts them into a structured, machine-usable specification.
-Build a second agent phase that consumes that specification and produces a
-syntactically valid, semantically faithful n8n workflow JSON file.
-Ground all node-level decisions in live, authoritative n8n documentation via MCP tool
-calls — not model memory — to minimise hallucinated node types or parameters.
-Validate every generated workflow programmatically before it reaches the user, with
-an automatic self-correction loop for recoverable errors.
-Ship a deployed, usable web application — not a notebook or local script — so the
-artefact can be evaluated end-to-end by a reviewer with no setup.
-Keep the initial node/integration surface deliberately scoped (see Section 8) so quality
-and reliability are provably high within that scope, rather than broad and inconsistent.
+## What this project is
+BotChain AI lets a business user describe a problem or process in plain language and
+receive back a ready-to-import n8n automation — no knowledge of nodes, APIs, or JSON
+required. A two-phase conversational agent (Plan → Build) interviews the user into a
+structured requirements spec, then generates a validated n8n workflow JSON file,
+grounding every node-level decision in live n8n documentation via the n8n-mcp server
+(1,600+ nodes) rather than model memory, and validating the result programmatically
+before it reaches the user.
 
-Context: This is a two-repo project. The Next.js frontend (botchain-ai-next-app)
-is already underway — Kinde auth is wired up, and the Prisma + Neon Postgres
-database is live with the User, Chat, Message, Attachment, CreditWallet,
-CreditTransaction, and PaymentTopup tables created. UI work on the
-/users/:userId routes is in progress there.
+This repo is the **Python/FastAPI backend**. It is being brought from a single working
+prototype (`prototype/prototype.py`) to a production-ready API. The Next.js frontend
+(`botchain-ai-next-app`, a separate repo) is already underway — Kinde auth wired, and the
+Prisma + Neon Postgres schema live in production. Backend↔frontend wiring (streaming
+routes through a Next.js proxy) happens only after this backend is in good shape.
 
-This repo (botchain-ai) is the Python/FastAPI backend. It currently only has
-a prototype (prototype.py) and planning docs — no production API yet. Your
-job now is to bring this repo to production-ready shape. It will later be
-connected to the Next.js app via streaming FastAPI routes, but that wiring
-happens after this backend itself is in good shape — don't try to build both
-sides at once.
-
-Before writing any code, do these in order:
-
-1. Read everything in `_markdown/` at the repo root first. It contains two
-   files — `python-fastapi-backendchecklist.md` and `backend-setup-qa.md` —
-   that define the phases, milestones, and already-settled architecture
-   decisions for this backend. This is the source of truth for what to build
-   and in what order. Don't invent your own sequencing or skip ahead to a
-   later phase before an earlier one is actually working.
-
-2. Read everything in `_nextjs_repo_context/` at the repo root before
-   touching anything database-related. It holds reference files from the
-   Next.js repo, including `contract.prisma` — the actual live schema of the
-   Neon Postgres database this backend will connect to. Those tables already
-   exist in production. Your SQLAlchemy models must match that schema
-   exactly — same table names, same columns. Do not rename, add, or drop
-   columns on tables Prisma owns (especially `users`) without flagging it to
-   me first; changing that side means a change on the Next.js repo too, not
-   just here.
-
-3. Note that the folder structure this backend should use is now spelled out
-   inside `python-fastapi-backendchecklist.md` (I updated it to include this).
-   Follow that structure exactly when scaffolding the repo, and keep it
-   consistent as you add files — don't drift into a different layout partway
-   through.
-
-Work through the checklist phase by phase, confirming each phase actually
-works before moving to the next. If anything in the checklist is ambiguous,
-or your implementation needs to diverge from it for a good reason, stop and
-tell me before proceeding rather than deciding silently.
-
-## 1. Tech stack (backend)
-
-| Layer | Choice | Why |
-|---|---|---|
-| Package/env mgmt | `uv` | You've already decided this — fast, clean lockfile |
-| Web framework | FastAPI | Async-native, pairs well with LangGraph streaming, easy OpenAPI docs |
-| Agent orchestration | LangGraph | State machine semantics fit Plan→Build; built-in persistence/checkpointing |
-| LLM | Claude (Anthropic API) via `langchain-anthropic` | You're already in the Claude ecosystem; good tool-use reliability |
-| MCP integration | `langchain-mcp-adapters` (official LangChain MCP client) | Converts MCP tools (from n8n-mcp) into LangChain-compatible tools with minimal glue code |
-| Session/state persistence | LangGraph checkpointer — start with `SqliteSaver`, move to `PostgresSaver` later | Lets a user close the tab mid-plan and resume |
-| Structured output | Pydantic models + LangChain's `.with_structured_output()` | Needed for the requirements spec and for forcing well-formed n8n JSON |
-| Streaming to frontend | SSE (`sse-starlette`) or WebSockets | Chat UIs feel broken without token streaming |
-| Validation | n8n-mcp's `validate_workflow` tool + your own JSON Schema check as a second pass | Defense in depth before handing the file to the user |
-
-## 2. Project structure
-
+## Repo map & current state
 ```
-n8n-agent-backend/
-├── pyproject.toml
-├── app/
-│   ├── main.py                 # FastAPI app, routes
-│   ├── api/
-│   │   ├── chat.py             # POST /chat, /chat/stream (SSE)
-│   │   └── sessions.py         # session CRUD, resume, download workflow
-│   ├── graph/
-│   │   ├── state.py            # Pydantic state schema for the graph
-│   │   ├── graph.py            # LangGraph StateGraph definition (nodes + edges)
-│   │   ├── nodes/
-│   │   │   ├── plan.py         # Plan-phase node(s)
-│   │   │   ├── confirm.py      # Human-in-the-loop confirmation / interrupt
-│   │   │   ├── build.py        # Build-phase agent loop
-│   │   │   └── validate.py     # Validation + self-correction loop
-│   │   └── mcp_client.py       # n8n-mcp connection + tool loading
-│   ├── models/
-│   │   ├── requirements.py     # Pydantic: RequirementsSpec
-│   │   └── workflow.py         # Pydantic: minimal n8n workflow shape (for pre-checks)
-│   ├── services/
-│   │   ├── storage.py          # session persistence (sqlite/postgres)
-│   │   └── export.py           # writes final .json, returns download path
-│   └── config.py               # env vars, settings via pydantic-settings
-├── tests/
-└── .env.example
+botchain-ai/
+├── prototype/prototype.py      # working single-agent prototype (terminal UI, SQLite checkpoints)
+├── prompts/                    # agent system prompt + the curated ~15-node surface
+├── notebooks/                  # prototyping notebook + testcase prompts (eval fixtures source)
+├── _markdown/                  # SOURCE OF TRUTH: build checklist + settled decisions
+├── _nextjs_repo_context/       # reference files from the Next.js repo (contract.prisma, etc.)
+├── src/app/                    # production backend (being built — see milestone plan)
+├── tests/                      # pytest suite (being built)
+└── pyproject.toml              # uv-managed
 ```
+Status: **production build in progress — working through the checklist in `_markdown/`
+phase by phase.** Phase 0 (scaffold) done — app imports and boots; next: Phase 1 (database).
 
-## 3. Core state design
+## Read first — source of truth (in this order)
+1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
+   confirmed `src/app` folder structure. This defines what to build and in what order;
+   do not invent your own sequencing or skip ahead before a phase is verified working.
+2. `_markdown/backend-setup-qa.md` — settled architecture decisions (Q1–Q10).
+3. `_nextjs_repo_context/prisma/contract.prisma` (+ `contract.json`) — the **live Neon
+   schema** this backend connects to. Read before touching anything database-related.
+   Also: `_nextjs_repo_context/AGENTS.md` + `nextjs-app-checklist.md` for frontend context.
+4. If anything in the checklist is ambiguous, or work needs to diverge from it — **stop
+   and ask**, don't decide silently.
 
-This is the most important design decision — get the shared state object right and everything else follows.
+## Non-negotiable database rules
+- SQLAlchemy models must match `contract.prisma` **exactly** — same table names, same
+  columns (already snake_case via `@map`). Do not rename, add, or drop columns on the
+  tables Prisma owns.
+- `users` stays **Prisma/Next.js-owned**. The backend is a **read-only consumer**: it
+  looks the thin User row up by `kinde_id` on auth and returns 401 if it's missing
+  (means the sync/registration didn't run — a real flow error, not something FastAPI
+  should paper over). FastAPI must never create, migrate, or alter that table. User
+  creation lives in one place only: the Next.js `/api/auth/sync` route. This avoids
+  the SELECT-then-INSERT TOCTOU race of two services both doing "check then insert"
+  on the same `kinde_id`-unique row.
+- **Baseline, don't recreate.** The tables already exist in production (Prisma created
+  them). Run `alembic revision --autogenerate`, verify an empty/near-empty diff, then
+  `alembic stamp head` — never `upgrade head` to recreate them.
+- LangGraph checkpoint tables are LangGraph-owned (created by `checkpointer.setup()` in
+  the lifespan) — not part of the Alembic-managed schema.
+- Never hand-edit tables in the Neon console.
+- Live DB: Neon project `botchain-ai` (`billowing-snow-05570527`), branch `production`
+  (br-aged-sunset-b39a2u2u), database `neondb`, `public` schema.
 
-```python
-class RequirementsSpec(BaseModel):
-    goal: str
-    trigger_type: str | None        # webhook, schedule, manual, form, etc.
-    services_involved: list[str]    # ["Gmail", "Slack", "Google Sheets"]
-    conditions_logic: str | None    # plain-language description of branching
-    data_flow: str | None           # what moves from where to where
-    constraints: list[str] = []     # rate limits, auth notes, etc.
-    open_questions: list[str] = []  # things still unclear
+## Production build plan (milestones)
+Each phase must be **verified working** before the next begins.
 
-class AgentState(BaseModel):
-    messages: list[BaseMessage]              # full chat history
-    phase: Literal["plan", "confirm", "build", "validate", "done"]
-    spec: RequirementsSpec | None = None
-    workflow_json: dict | None = None
-    validation_errors: list[str] = []
-    retry_count: int = 0
+| # | Milestone | Deliverables | Verification gate | Status |
+|---|---|---|---|---|
+| 0 | Repo scaffold | `src/app/` skeleton per checklist; deps (fastapi, uvicorn, sqlalchemy[asyncio], asyncpg, alembic, pydantic-settings, langgraph-checkpoint-postgres, python-jose; drop aiosqlite/sqlite-checkpointer); `config.py` via pydantic-settings (fixes prototype's `os.environ` None-crash); `.env.example` | App imports and boots | Done (import + /health 200 + ruff clean) |
+| 1 | Database | 7 SQLAlchemy 2.0 async models matching contract.prisma; alembic wired to direct `DATABASE_URL`; empty autogen diff → `stamp head` | Empty diff committed; app queries live DB | Not started |
+| 2 | Auth | `core/security.py` Kinde JWT verification via JWKS (`<issuer>/.well-known/jwks`, cached); `deps.py` `current_user` (sub→User **read-only**, per-request cache, **401 if no User row** — no get-or-create) | Test JWT passes/fails against stub JWKS | Not started |
+| 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Not started |
+| 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Not started |
+| 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Not started |
+| 6 | Streaming | Message route returns StreamingResponse (Vercel AI SDK **Text Stream Protocol**, plain chunks) | Incremental tokens over curl | Not started |
+| 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
+| 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
+| 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for `npx n8n-mcp`); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main) | `docker build` passes locally | Not started |
+| 10 | First deploy (deferred) | Railway deploy + e2e smoke | — | Out of current scope — user runs it |
+
+## Settled decisions (do not re-litigate without a reason)
+- **ORM:** SQLAlchemy 2.0 typed async models (NOT SQLModel).
+- **LLM:** Ollama (`ChatOllama`, cloud `nemotron-3-ultra:cloud`) for now, **behind
+  `services/llm.py`** so swapping to Claude later touches one file only.
+- **Auth:** Kinde JWT via JWKS (`python-jose`); token arrives via the Next.js proxy route
+  (frontend-phase wiring), CORS is a non-issue if that proxy pattern holds.
+- **`current_user`:** read-only `kinde_id` → User lookup. No get-or-create. A missing
+  User row → **401** ("registration not complete"); the Next.js `/api/auth/sync` route
+  is the single owner of user creation, so FastAPI never races it.
+- **DB connection:** direct (non-pooled) `DATABASE_URL` for the app and Alembic.
+- **Tests DB:** a dedicated `tests` Neon branch (stamped head), never the production data.
+- **Checkpointer:** `AsyncPostgresSaver` on the same `DATABASE_URL`, `setup()` at startup;
+  conversation memory uses `Chat.context_summary` (no extra table).
+- **Approval gate:** LangGraph `interrupt()` surfaced through `POST /api/v1/chats/{id}/approve`;
+  UI approval actions come in the frontend phase.
+- **Streaming:** Text Stream Protocol first (plain incremental text); upgrade to the Data
+  Stream Protocol later for tool-call/reasoning indicators.
+- **Sandbox/state:** single Railway replica; sandbox is per-turn scratch; workflow JSON
+  persisted to `Message.meta` at the end of each build.
+- **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,
+  or payment calls yet. Treat every request as free during this phase.
+- **n8n-mcp:** self-hosted stdio (`npx n8n-mcp`) with env injection; core tools work with
+  no n8n instance; cache `search_nodes`/`get_node` results in-memory. Use the real tool
+  names (see Frontend context below) — there is no `get_node_essentials` tool.
+- **Model choice:** curated ~15-node surface (Webhook, HTTP Request, Set, IF/Switch, Code,
+  Schedule Trigger, Gmail, Slack, Google Sheets, Telegram…) preferred in the plan prompt.
+- **LangSmith:** tracing controlled by env vars; off by default in prod unless explicitly set.
+
+## Architecture
+
+### Folder structure (from the checklist — stay in it)
+Under a `src/` root so the app package is `src/app/`:
+```
+app/
+├── main.py        # FastAPI instance, lifespan, router mounts, CORS
+├── config.py      # pydantic-settings: DATABASE_URL, KINDE_ISSUER_URL, keys
+├── db.py          # async engine + session factory + get_session dep
+├── deps.py        # shared Depends: current_user, pagination, ownership
+├── models/        # chat.py, message.py, billing.py (+ __init__.py)
+├── schemas/       # Pydantic request/response DTOs (chat/message/billing)
+├── api/           # router.py aggregates; v1/: chats.py, messages.py, credits.py, webhooks.py
+├── services/      # llm.py, context.py, billing.py, agent.py, checkpoint.py, payments/
+└── core/          # security.py, exceptions.py
 ```
 
-`phase` is your explicit mode switch — the frontend can read it to show "Planning…" vs "Building…" indicators, and it's also what routes the LangGraph edges.
+### Core state design
+`RequirementsSpec` (goal, trigger_type, services_involved, conditions_logic, data_flow,
+constraints, open_questions) + `AgentState` (messages, phase, spec, workflow_json,
+validation_errors, retry_count). `phase` is the mode switch the frontend reads to show
+"Planning…" vs "Building…" and is what routes the LangGraph edges.
 
-## 4. Graph flow
-
+### Graph flow
 ```
-START → plan_node ⇄ (loops with user until spec is "complete enough")
+START → plan_node ⇄ (loops with the user until the spec is complete & no open questions)
               ↓
-        confirm_node (interrupt: "Here's what I understood — build it?")
-              ↓ (user confirms)
+        confirm_node (interrupt: plain-English spec summary — build it?)
+              ↓ (user confirms via /approve)
         build_node → validate_node → (pass) → END
-                          ↓ (fail, retry_count < N)
-                     build_node (self-correct with validation errors fed back in)
+                          ↓ (fail, retry_count < 3)
+                     build_node (self-correct on validation errors) → surface gracefully if not converged
+```
+- plan_node: chat loop that fills `RequirementsSpec` via structured output each turn.
+- confirm_node: `request_human_approval` port — LangGraph interrupt resumed via `/approve`.
+- build_node: LLM with n8n-mcp tools bound + `write_json_file`; assemble workflow JSON.
+- validate_node: `build_workflow_with_validation` (validate → self-repair, ≤3 retries);
+  final validated JSON persisted to `Message.meta`.
+
+### API surface (v1, user-scoped)
+```
+POST   /api/v1/chats                          create chat
+GET    /api/v1/chats                          list user's chats
+GET/PATCH/DELETE /api/v1/chats/{chat_id}      read / rename / soft-delete
+GET    /api/v1/chats/{chat_id}/messages       history (resume)
+POST   /api/v1/chats/{chat_id}/messages       send message → streaming text response
+POST   /api/v1/chats/{chat_id}/approve        resume interrupted graph (approved + feedback)
+GET    /api/v1/credits                        stub (balance)
+POST   /api/v1/webhooks/...                    stub (payments — Razorpay later)
 ```
 
-Key mechanics:
-- **plan_node**: a chat loop that also tries, each turn, to fill in `RequirementsSpec` via structured output. Once all required fields are non-null and there are no `open_questions`, it proposes moving to confirm.
-- **confirm_node**: uses LangGraph's `interrupt()` to pause execution and show the user a plain-English summary of the spec before touching Build — cheap insurance against building the wrong thing.
-- **build_node**: an agent loop with n8n-mcp tools bound (`search_nodes`, `get_node_essentials`, `get_node_documentation`, etc.), synthesizing the workflow JSON from the spec + tool results.
-- **validate_node**: calls `validate_workflow` (n8n-mcp) and/or your own schema check; if it fails, route back to build_node with the errors appended to state so the model can self-correct. Cap retries (e.g. 3) so it doesn't loop forever — surface remaining errors to the user if it can't converge.
+## Guardrails (inherited from the system prompt — keep them)
+- Never fabricate a node type, parameter, credential field, or API endpoint — ground via
+  MCP lookups; only include properties actually retrieved.
+- Never write real secrets/keys/tokens into workflow JSON — empty credential placeholders
+  only; warn the user if they share live secrets in chat.
+- Never call a workflow "done" without passing validation AND explicit human approval.
+- Cap validation retries at 3; on non-convergence deliver best-effort JSON + a clear list
+  of remaining issues and manual-fix instructions — never silently fail.
+- Schema validity ≠ logical correctness: the build loop also re-reads spec vs. workflow
+  to flag mismatches before delivery.
 
-## 5. MCP integration specifics
+## Conventions & tooling
+- **uv** for everything: `uv sync`, `uv add`, `uv run`. Python pinned via `.python-version`
+  (3.14).
+- Lint with ruff; tests with pytest + pytest-asyncio. No code comments unless necessary.
+- `.env` is gitignored. `.env.example` holds placeholders only. Never commit secrets.
+- ALWAYS check current phase progress before starting; work the checklist in order and
+  confirm each phase works before moving on. Ambiguity → stop and ask the user.
 
-`langchain-mcp-adapters` gives you something like:
+## Running / developing
+1. `uv sync` (installs from `pyproject.toml` + `uv.lock`).
+2. `.env` — required: `DATABASE_URL` (direct, not pooled), `KINDE_ISSUER_URL` (+ optional
+   `KINDE_AUDIENCE`), `OLLAMA_API_KEY`, `N8N_API_URL`, `N8N_API_KEY`, `CORS_ORIGINS`,
+   `LANGSMITH_*` (tracing off by default).
+3. Run API: `uv run uvicorn app.main:app --reload` (reload optional).
+4. Alembic: `uv run alembic revision --autogenerate -m "..."` → confirm diff → `uv run
+   alembic upgrade head` (or `stamp head` for the Prisma-created baseline).
+5. Tests: `uv run pytest` (uses the `tests` Neon branch).
+6. End-to-end agent smoke (Phase 5+): feed a prompt from `notebooks/testcases.md` through
+   `POST /messages` with Ollama + n8n-mcp running.
 
-```python
-from langchain_mcp_adapters.client import MultiServerMCPClient
+## External resources
+- Neon (DB): project `botchain-ai` (`billowing-snow-05570527`), branch `production`
+  (br-aged-sunset-b39a2u2u), db `neondb`. `tests` branch reserved for test runs.
+- Kinde: issuer URL supplied by the repo owner; JWKS at `<issuer>/.well-known/jwks`.
+- Ollama Cloud: `OLLAMA_API_KEY` (cloud-hosted model, base URL https://ollama.com).
+- n8n-mcp: via `npx n8n-mcp` (stdio, self-hosted). Core tools (search/get/validate)
+  need no n8n instance; the management tools need `N8N_API_URL` + `N8N_API_KEY`.
 
-client = MultiServerMCPClient({
-    "n8n": {
-        "transport": "stdio",  # or "sse"/"http" if using hosted n8n-mcp
-        "command": "npx",
-        "args": ["n8n-mcp"],
-    }
-})
-tools = await client.get_tools()
-```
+## Frontend context (`botchain-ai-next-app`, separate repo)
+Facts captured by exploring the Next.js repo — keep them in mind so the two sides meet
+without surprises at wiring time (frontend↔backend wiring is frontend-phase work, done
+only after this backend repo is in good shape).
 
-Bind `tools` to your build-phase LLM call. One decision to make early: **self-host n8n-mcp locally in your container vs. use their hosted version** — self-hosting is more reliable for a demo (no external dependency going down mid-presentation) but needs the `n8n-nodes-base` package available, which adds build time. Self-hosted stdio is probably your safest bet for a judged demo.
-
-## 6. API surface (minimal viable)
-
-```
-POST /sessions                    → create new session, returns session_id
-POST /sessions/{id}/chat          → send a message, returns agent reply + phase
-GET  /sessions/{id}/chat/stream   → SSE stream of the above (for token-by-token UI)
-GET  /sessions/{id}/spec          → current RequirementsSpec (for a "requirements" side panel)
-POST /sessions/{id}/confirm       → resumes graph from confirm interrupt
-GET  /sessions/{id}/workflow      → download final validated .json
-GET  /sessions/{id}/history       → full message history (for resume)
-```
-
-## Recommendations / things to account for
-
-**Scope the node/service surface deliberately.** n8n-mcp covers 1,600+ nodes, but for a project demo you don't need all of them to work — decide on ~15-20 well-tested nodes (Webhook, HTTP Request, Set, IF/Switch, Code, Schedule Trigger, Gmail, Slack, Google Sheets, Telegram) and mention in your plan-phase prompt that the agent should prefer these, falling back to others only if necessary. This bounds your testing surface and demo risk.
-
-**Guard against credential/secrets leakage in output.** The agent will generate nodes needing OAuth/API credentials — make sure the exported JSON never contains actual secret values, only credential *placeholders* (n8n handles credentials separately from workflow JSON anyway, but double check your prompt doesn't ask the model to fabricate example tokens).
-
-**Add a "critic" pass, not just schema validation.** Schema validity ≠ logical correctness. Consider a lightweight node in the graph that re-reads the spec vs. the generated workflow and flags mismatches ("spec says Slack DM on failure, workflow only has success path") before showing the file to the user. Cheap to add, meaningfully improves output quality for your demo.
-
-**Rate-limit / cache MCP calls.** `search_nodes` and `get_node_essentials` will get called repeatedly for common nodes across sessions — an in-memory or Redis cache keyed by node name saves latency and API calls during a live demo.
-
-**Decide now: streaming granularity.** Users will find "thinking silently for 20 seconds during Build" bad UX. Stream intermediate status ("Searching for Slack node…", "Validating workflow…") even if you're not streaming raw tokens for that phase — LangGraph's `astream_events` gives you this for free if you tap into node-level events.
-
-**Plan for graceful validation failure.** Sometimes the agent won't converge in 3 retries. Have a defined fallback: return the best-effort JSON *plus* a clear list of remaining issues and manual fix instructions, rather than silently failing. Judges will appreciate seeing you handled the unhappy path.
-
-**Write a handful of eval fixtures early.** 5-10 fixed (prompt → expected workflow shape) pairs you can run through the pipeline as a smoke test after any change. Saves you from "it worked yesterday" surprises right before a demo.
-
-**Session persistence matters more than it seems.** If your judged demo involves any live back-and-forth, a browser refresh shouldn't lose state — `SqliteSaver` checkpointing is nearly free to wire up now and saves you from a bad live moment later.
-
-Want me to scaffold the actual `pyproject.toml` + skeleton files next, or go deeper on any one node (e.g. the build_node agent loop logic) first?
+- Frontend: Next.js 16 App Router, **Kinde hosted auth**, Prisma 8 contract mode → Neon;
+  `pnpm` only (ours is `uv`). It is at its own Phase 3 (chat UI shell — mock cards and
+  skeletons, **no API calls yet**). Its live `src/prisma/contract.prisma` was verified
+  byte-identical to the copy in `_nextjs_repo_context/`.
+- User-facing identifier is the **local `User.id`** (Postgres UUID), not `kindeId`.
+  Frontend routes are `/users/{User.id}/…` and its layout resolves `kindeId` → local
+  User (redirects on mismatch). Use `User.id` in all backend payloads.
+- User creation lives only in the frontend `/api/auth/sync` route (creates User +
+  CreditWallet 5.00 + CreditTransaction `signup_grant` in one transaction). Backend is a
+  read-only consumer — see DB rules above. Env names: frontend `DATABASE_URL` = pooled,
+  `DIRECT_URL` = unpooled; the backend must use the **direct** URL.
+- Real n8n-mcp tools (7 core, no n8n instance needed): `tools_documentation`,
+  `search_nodes`, `get_node` (mode `essentials`/`full`/…), `validate_node`,
+  `validate_workflow`, `search_templates`, `get_template`; 16 management tools need
+  `N8N_API_URL`/`N8N_API_KEY`. Use these real names — there is no `get_node_essentials`.
+- Approval-gate reconciliation (revisit at wiring phase): frontend planning docs wanted a
+  `Message.status` "pending_approval" flag; this repo's settled decision is LangGraph
+  `interrupt()` surfaced via `POST /api/v1/chats/{id}/approve`. The `Message` table has
+  no `status` column, so "waiting for approval" is signaled via `Message.meta` JSON.
