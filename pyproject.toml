@@ -41,3 +41,11 @@ packages = ["src/app"]
 
 [tool.ruff]
 extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+extend-ignore = ["B008"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"

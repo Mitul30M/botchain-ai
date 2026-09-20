@@ -9,11 +9,13 @@ from app.config import get_settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Run startup/shutdown setup; currently loads settings onto app.state."""
     app.state.settings = get_settings()
     yield
 
 
 def create_app() -> FastAPI:
+    """Build and configure the FastAPI application (settings, CORS, router)."""
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version=settings.app_version, lifespan=lifespan)
 
@@ -30,6 +32,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:
+        """Return a simple liveness response."""
         return {"status": "ok"}
 
     return app

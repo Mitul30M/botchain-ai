@@ -12,6 +12,12 @@ _session_factory = None
 
 
 def postgres_uri(driver: str) -> str:
+    """Rewrite the configured DATABASE_URL for the given SQLAlchemy driver.
+
+    asyncpg cannot accept Neon's libpq-only query params (sslmode,
+    channel_binding, uselibpqcompat), and psycopg rejects uselibpqcompat;
+    each driver gets a URL stripped of the params it can't consume.
+    """
     raw = get_settings().database_url
     if not raw:
         return raw
@@ -28,6 +34,7 @@ def postgres_uri(driver: str) -> str:
 
 
 def get_engine():
+    """Return the process-wide async engine, creating it on first use."""
     global _engine
     if _engine is None:
         _engine = create_async_engine(
@@ -39,6 +46,7 @@ def get_engine():
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return the process-wide async session factory, creating it lazily."""
     global _session_factory
     if _session_factory is None:
         _session_factory = async_sessionmaker(get_engine(), class_=AsyncSession, expire_on_commit=False)
@@ -46,5 +54,6 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
+    """Yield an AsyncSession for the lifetime of one request dependency."""
     async with get_session_factory()() as session:
         yield session

@@ -16,4 +16,5 @@ class Base(DeclarativeBase):
 
 
 def new_id() -> str:
+    """Return a random UUID4 as a string for client-side primary keys."""
     return str(uuid.uuid4())
