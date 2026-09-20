@@ -37,9 +37,7 @@ class Message(Base):
         remote_side=[id], back_populates="replies"
     )
     replies: Mapped[list[Message]] = relationship(back_populates="parent")
-    attachments: Mapped[list[Attachment]] = relationship(
-        back_populates="message", passive_deletes=True
-    )
+    attachments: Mapped[list[Attachment]] = relationship(back_populates="message")
 
 
 class Attachment(Base):
