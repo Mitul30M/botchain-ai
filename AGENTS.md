@@ -28,7 +28,8 @@ botchain-ai/
 └── pyproject.toml              # uv-managed
 ```
 Status: **production build in progress — working through the checklist in `_markdown/`
-phase by phase.** Phase 0 (scaffold) done — app imports and boots; next: Phase 1 (database).
+phase by phase.** Phase 1 (database) done — 7 SQLAlchemy models match the live Prisma
+schema with a zero-diff Alembic baseline (`3169311c48d2` stamped); next: Phase 2 (auth).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -67,7 +68,7 @@ Each phase must be **verified working** before the next begins.
 | # | Milestone | Deliverables | Verification gate | Status |
 |---|---|---|---|---|
 | 0 | Repo scaffold | `src/app/` skeleton per checklist; deps (fastapi, uvicorn, sqlalchemy[asyncio], asyncpg, alembic, pydantic-settings, langgraph-checkpoint-postgres, python-jose; drop aiosqlite/sqlite-checkpointer); `config.py` via pydantic-settings (fixes prototype's `os.environ` None-crash); `.env.example` | App imports and boots | Done (import + /health 200 + ruff clean) |
-| 1 | Database | 7 SQLAlchemy 2.0 async models matching contract.prisma; alembic wired to direct `DATABASE_URL`; empty autogen diff → `stamp head` | Empty diff committed; app queries live DB | Not started |
+| 1 | Database | 7 SQLAlchemy 2.0 async models matching contract.prisma; alembic wired to direct `DATABASE_URL`; empty autogen diff → `stamp head` | Empty diff committed; app queries live DB | Done (zero-diff baseline `3169311c48d2` stamped; live ORM + psycopg/asyncpg both verified) |
 | 2 | Auth | `core/security.py` Kinde JWT verification via JWKS (`<issuer>/.well-known/jwks`, cached); `deps.py` `current_user` (sub→User **read-only**, per-request cache, **401 if no User row** — no get-or-create) | Test JWT passes/fails against stub JWKS | Not started |
 | 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Not started |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Not started |
