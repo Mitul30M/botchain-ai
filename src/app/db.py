@@ -7,7 +7,7 @@ from app.config import get_settings
 
 _ASYNC_PG_DROP_KEYS = {"sslmode", "channel_binding", "uselibpqcompat"}
 
-_pg_drop_keys = {"sslmode", "channel_binding", "uselibpqcompat"}
+_PSYCOPG_DROP_KEYS = {"uselibpqcompat"}
 
 _engine = None
 _session_factory = None
@@ -17,14 +17,15 @@ def postgres_uri(driver: str) -> str:
     """Rewrite the configured DATABASE_URL for the given SQLAlchemy driver.
 
     asyncpg cannot accept Neon's libpq-only query params (sslmode,
-    channel_binding, uselibpqcompat), and psycopg rejects all three;
-    each driver gets a URL stripped of the params it can't consume.
+    channel_binding, uselibpqcompat), so all three are stripped.
+    psycopg/libpq understands sslmode and channel_binding natively;
+    only uselibpqcompat (a Neon-specific flag) is dropped.
     """
     raw = get_settings().database_url
     if not raw:
         return raw
     url = make_url(raw)
-    drop_keys = _pg_drop_keys if driver == "psycopg" else _ASYNC_PG_DROP_KEYS
+    drop_keys = _PSYCOPG_DROP_KEYS if driver == "psycopg" else _ASYNC_PG_DROP_KEYS
     query: dict[str, str] = {}
     for key, value in url.query.items():
         if key in drop_keys:
