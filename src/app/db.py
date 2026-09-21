@@ -7,6 +7,8 @@ from app.config import get_settings
 
 _ASYNC_PG_DROP_KEYS = {"sslmode", "channel_binding", "uselibpqcompat"}
 
+_pg_drop_keys = {"sslmode", "channel_binding", "uselibpqcompat"}
+
 _engine = None
 _session_factory = None
 
@@ -15,22 +17,30 @@ def postgres_uri(driver: str) -> str:
     """Rewrite the configured DATABASE_URL for the given SQLAlchemy driver.
 
     asyncpg cannot accept Neon's libpq-only query params (sslmode,
-    channel_binding, uselibpqcompat), and psycopg rejects uselibpqcompat;
+    channel_binding, uselibpqcompat), and psycopg rejects all three;
     each driver gets a URL stripped of the params it can't consume.
     """
     raw = get_settings().database_url
     if not raw:
         return raw
     url = make_url(raw)
+    drop_keys = _pg_drop_keys if driver == "psycopg" else _ASYNC_PG_DROP_KEYS
     query: dict[str, str] = {}
     for key, value in url.query.items():
-        if driver == "asyncpg" and key in _ASYNC_PG_DROP_KEYS:
-            continue
-        if driver == "psycopg" and key == "uselibpqcompat":
+        if key in drop_keys:
             continue
         query[key] = value
     url = url.set(drivername=f"postgresql+{driver}", query=query)
     return url.render_as_string(hide_password=False)
+
+
+def psycopg_conninfo() -> str:
+    """Return a plain ``postgresql://`` conninfo string for psycopg3.
+
+    Strips the ``+psycopg`` dialect suffix that postgres_uri() adds for
+    SQLAlchemy, since psycopg3's native connect does not accept it.
+    """
+    return postgres_uri("psycopg").replace("postgresql+psycopg://", "postgresql://", 1)
 
 
 def get_engine():

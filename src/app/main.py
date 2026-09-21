@@ -5,13 +5,25 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.config import get_settings
+from app.services.checkpoint import setup_checkpoint
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run startup/shutdown setup; currently loads settings onto app.state."""
+    """Startup: settings + checkpointer pool; shutdown: pool closes automatically."""
     app.state.settings = get_settings()
+
+    ckpt = await setup_checkpoint()
+    app.state.checkpointer = ckpt.checkpointer
+    app.state.ckpt_service = ckpt
+
+    app.state.agent = None      # Phase 5
+    app.state.model = None      # Phase 5
+    app.state.mcp_client = None  # Phase 5
+
     yield
+
+    await ckpt.close()
 
 
 def create_app() -> FastAPI:

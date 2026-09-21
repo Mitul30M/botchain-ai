@@ -31,7 +31,8 @@ Status: **production build in progress — working through the checklist in `_ma
 phase by phase.** Phase 1 (database) done — 7 SQLAlchemy models match the live Prisma
 schema with a zero-diff Alembic baseline (`3169311c48d2` stamped);
 Phase 2 (auth) done — Kinde JWKS verification + read-only `current_user`;
-next: Phase 3 (checkpointing).
+Phase 3 (checkpointing) done — `AsyncPostgresSaver` on pool, Alembic exclusion verified;
+next: Phase 4 (core API routes).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -72,7 +73,7 @@ Each phase must be **verified working** before the next begins.
 | 0 | Repo scaffold | `src/app/` skeleton per checklist; deps (fastapi, uvicorn, sqlalchemy[asyncio], asyncpg, alembic, pydantic-settings, langgraph-checkpoint-postgres, python-jose; drop aiosqlite/sqlite-checkpointer); `config.py` via pydantic-settings (fixes prototype's `os.environ` None-crash); `.env.example` | App imports and boots | Done (import + /health 200 + ruff clean) |
 | 1 | Database | 7 SQLAlchemy 2.0 async models matching contract.prisma; alembic wired to direct `DATABASE_URL`; empty autogen diff → `stamp head` | Empty diff committed; app queries live DB | Done (zero-diff baseline `3169311c48d2` stamped; live ORM + psycopg/asyncpg both verified) |
 | 2 | Auth | `core/security.py` Kinde JWT verification via JWKS (`<issuer>/.well-known/jwks.json`, cached); `deps.py` `current_user` (sub→User **read-only**, per-request cache, **401 if no User row** — no get-or-create) | Test JWT passes/fails against stub JWKS | Done (18 pytest cases green: minted RS256 JWTs vs mocked JWKS + read-only current_user; live JWKS fetch OK) |
-| 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Not started |
+| 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Done (pool-based factory, 4 tables in Neon, Alembic exclusion verified, 21 pytest green) |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Not started |
 | 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Not started |
 | 6 | Streaming | Message route returns StreamingResponse (Vercel AI SDK **Text Stream Protocol**, plain chunks) | Incremental tokens over curl | Not started |

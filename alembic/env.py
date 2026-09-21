@@ -15,10 +15,24 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+_PRISMA_TABLES = frozenset({"_prisma_migrations"})
+
+_LANGGRAPH_TABLES = frozenset({
+    "checkpoint_migrations",
+    "checkpoints",
+    "checkpoint_blobs",
+    "checkpoint_writes",
+})
+
+_EXCLUDED_TABLES = _PRISMA_TABLES | _LANGGRAPH_TABLES
+
+
 def include_object(object, name, type_, reflected, compare_to):
-    return getattr(object, "schema", None) in (None, "public") and not (
-        type_ == "table" and name == "_prisma_migrations"
-    )
+    if getattr(object, "schema", None) not in (None, "public"):
+        return False
+    if type_ == "table" and name in _EXCLUDED_TABLES:
+        return False
+    return True
 
 
 def run_migrations_offline() -> None:
