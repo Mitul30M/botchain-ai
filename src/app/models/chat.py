@@ -23,7 +23,7 @@ class Chat(Base):
     context_summary: Mapped[str | None]
     pinned: Mapped[bool] = mapped_column(server_default=text("false"))
     archived: Mapped[bool] = mapped_column(server_default=text("false"))
-    meta: Mapped[dict] = mapped_column(server_default=text("'{}'::json"))
+    meta: Mapped[dict] = mapped_column(default=dict, server_default=text("'\"{}\"'::json"))
     created_at: Mapped[dt.datetime] = mapped_column(server_default=text("now()"))
     updated_at: Mapped[dt.datetime] = mapped_column(server_default=text("now()"))
     deleted_at: Mapped[dt.datetime | None]

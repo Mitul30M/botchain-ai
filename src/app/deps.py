@@ -1,10 +1,11 @@
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import verify_token
 from app.db import get_session
-from app.models import User
+from app.models import Chat, User
+from app.schemas.common import PageParams
 
 
 def _bearer_token(request: Request) -> str:
@@ -60,3 +61,34 @@ async def get_current_user(
 
     request.state.current_user = user
     return user
+
+
+async def paginate(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> PageParams:
+    """Parse common `page`/`page_size` query params into a shared PageParams."""
+    return PageParams(page=page, page_size=page_size)
+
+
+async def get_owned_chat(
+    chat_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> Chat:
+    """Resolve a non-soft-deleted chat owned by the current user.
+
+    Returns 404 for a missing chat, a soft-deleted chat, or a chat that belongs
+    to someone else — the handler never learns that another user's chat exists.
+    """
+    chat = (
+        await session.execute(
+            select(Chat).where(Chat.id == chat_id, Chat.deleted_at.is_(None))
+        )
+    ).scalar_one_or_none()
+    if chat is None or chat.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat not found",
+        )
+    return chat

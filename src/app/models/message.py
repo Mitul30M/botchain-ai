@@ -29,7 +29,7 @@ class Message(Base):
     output_tokens: Mapped[int | None]
     credits_cost: Mapped[Decimal | None]
     is_error: Mapped[bool] = mapped_column(server_default=text("false"))
-    meta: Mapped[dict] = mapped_column(server_default=text("'{}'::json"))
+    meta: Mapped[dict] = mapped_column(default=dict, server_default=text("'\"{}\"'::json"))
     created_at: Mapped[dt.datetime] = mapped_column(server_default=text("now()"))
 
     chat: Mapped[Chat] = relationship(back_populates="messages")
