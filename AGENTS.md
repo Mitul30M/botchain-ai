@@ -32,7 +32,11 @@ phase by phase.** Phase 1 (database) done — 7 SQLAlchemy models match the live
 schema with a zero-diff Alembic baseline (`3169311c48d2` stamped);
 Phase 2 (auth) done — Kinde JWKS verification + read-only `current_user`;
 Phase 3 (checkpointing) done — `AsyncPostgresSaver` on pool, Alembic exclusion verified;
-next: Phase 4 (core API routes).
+Phase 4 (core routes) done — CRUD + streaming messages + approve (live smoke, see Phase 4 notes);
+Phase 5 (LangGraph flow) done — Plan→Confirm→Build→Validate ported, approval interrupt via
+`/approve`, verified end-to-end against real Ollama + n8n-mcp (validated 2-node Webhook+Slack
+workflow) plus a concurrent-build isolation smoke (see Phase 5 notes in the checklist);
+next: Phase 6 (streaming).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -75,7 +79,7 @@ Each phase must be **verified working** before the next begins.
 | 2 | Auth | `core/security.py` Kinde JWT verification via JWKS (`<issuer>/.well-known/jwks.json`, cached); `deps.py` `current_user` (sub→User **read-only**, per-request cache, **401 if no User row** — no get-or-create) | Test JWT passes/fails against stub JWKS | Done (18 pytest cases green: minted RS256 JWTs vs mocked JWKS + read-only current_user; live JWKS fetch OK) |
 | 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Done (pool-based factory, 4 tables in Neon, Alembic exclusion verified) |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Done (all routes smoky green against live Neon: create/list/get/rename, happy+disconnect streams (is_error row persisted), approve 409+round-trip, 404s, soft-delete; ruff + 23 pytest green; disconnect flush is a strongly-referenced fire-and-forget task with logged failures) |
-| 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Not started |
+| 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green) |
 | 6 | Streaming | Message route returns StreamingResponse (Vercel AI SDK **Text Stream Protocol**, plain chunks) | Incremental tokens over curl | Not started |
 | 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
 | 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
