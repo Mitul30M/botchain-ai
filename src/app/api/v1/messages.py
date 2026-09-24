@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,9 +15,13 @@ from app.schemas.message import ApproveRequest, MessageCreate, MessageOut
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 APPROVAL_PENDING = "pending"
 
 _STUB_CHUNK_DELAY = 0.02
+
+_background_tasks: set[asyncio.Task] = set()
 
 
 async def _stub_chunks(content: str) -> AsyncIterator[str]:
@@ -49,6 +54,27 @@ async def _flush_assistant_row(chat_id: str, content: str, is_error: bool) -> No
         await session.commit()
 
 
+def _forget_task(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    if exc := task.exception():
+        logger.error("background assistant flush failed", exc_info=exc)
+
+
+def _fire_and_forget(coro) -> None:
+    """Run a coroutine on a background task with a strong reference.
+
+    asyncio keeps only weak references to tasks, so a bare
+    ``asyncio.create_task`` can be garbage-collected mid-flight once the
+    generator that spawned it is gone. Holding the task in a module-level set
+    keeps it alive, and the done-callback releases it and surfaces any failure.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_forget_task)
+
+
 async def _assistant_stream(chat_id: str, content: str) -> AsyncIterator[str]:
     """Forward stub chunks to the client while buffering the full reply.
 
@@ -58,7 +84,8 @@ async def _assistant_stream(chat_id: str, content: str) -> AsyncIterator[str]:
     response returns, so this generator opens its own session for the insert.
     On client disconnect uvicorn cancels the request task, so a finally-block
     await would be re-cancelled before committing; in that case the write is
-    handed to a detached task that survives the request task's cancellation.
+    handed to a strongly-referenced background task that survives the request
+    task's cancellation.
     """
     buffer: list[str] = []
     is_error = False
@@ -73,7 +100,7 @@ async def _assistant_stream(chat_id: str, content: str) -> AsyncIterator[str]:
     finally:
         reply = "".join(buffer)
         if request_task is not None and request_task.cancelling():
-            asyncio.create_task(_flush_assistant_row(chat_id, reply, is_error=True))
+            _fire_and_forget(_flush_assistant_row(chat_id, reply, is_error=True))
         else:
             await _flush_assistant_row(chat_id, reply, is_error)
 
