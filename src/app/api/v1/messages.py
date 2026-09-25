@@ -1,17 +1,19 @@
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Mapping
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.db import get_session, get_session_factory
 from app.deps import get_owned_chat, paginate
-from app.models import Chat, Message
+from app.models import Attachment, Chat, Message, new_id
 from app.schemas.common import PageParams, Paginated
 from app.schemas.message import ApproveRequest, MessageCreate, MessageOut
 
@@ -60,6 +62,19 @@ def _status_text(payload: object) -> str:
     return str(payload)
 
 
+def _chunk_usage(chunk: AIMessage) -> tuple[int | None, int | None]:
+    """Extract (input_tokens, output_tokens) from a streamed message chunk.
+
+    The provider populates ``usage_metadata`` only on the final chunk of each
+    generation, so a run's totals are the sum over every usage-bearing chunk
+    (plan structured call, build tool-loop calls, repair passes all stream).
+    """
+    usage = getattr(chunk, "usage_metadata", None)
+    if not isinstance(usage, Mapping):
+        return None, None
+    return usage.get("input_tokens"), usage.get("output_tokens")
+
+
 def _forget_task(task: asyncio.Task) -> None:
     _background_tasks.discard(task)
     if task.cancelled():
@@ -95,6 +110,10 @@ async def _flush_assistant_row(
     is_error: bool,
     meta: dict | None = None,
     context_summary: str | None = None,
+    user_message_id: str | None = None,
+    parent_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
 ) -> None:
     """Persist one assistant Message row (open its own session; commit).
 
@@ -102,6 +121,11 @@ async def _flush_assistant_row(
     the handler's response returns, so this generator opens a fresh session for
     the write. When meta signals a pending approval the chat row's
     context_summary is set to the confirm summary if it isn't already present.
+
+    The user row that triggered the run (when user_message_id is given) is
+    backfilled with the run's token totals, the assistant row references its
+    parent, and a finalized workflow (phase "done") is stored as an Attachment
+    row pointing at a download route that serves it from Message.meta.
     """
     async with get_session_factory()() as session:
         if context_summary is not None:
@@ -112,15 +136,38 @@ async def _flush_assistant_row(
             ).scalar_one_or_none()
             if chat is not None and not chat.context_summary:
                 chat.context_summary = context_summary
-        session.add(
-            Message(
-                chat_id=chat_id,
-                role="assistant",
-                content=content,
-                is_error=is_error,
-                meta=meta or {},
+        if user_message_id is not None:
+            await session.execute(
+                update(Message)
+                .where(Message.id == user_message_id, Message.chat_id == chat_id)
+                .values(input_tokens=input_tokens, output_tokens=0)
             )
+        assistant = Message(
+            chat_id=chat_id,
+            role="assistant",
+            content=content,
+            is_error=is_error,
+            meta=meta or {},
+            parent_id=parent_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
+        session.add(assistant)
+        await session.flush()
+
+        workflow = (meta or {}).get("workflow_json")
+        if (meta or {}).get("phase") == "done" and workflow is not None:
+            attachment_id = new_id()
+            session.add(
+                Attachment(
+                    id=attachment_id,
+                    message_id=assistant.id,
+                    file_name=(meta or {}).get("workflow_name") or "workflow.json",
+                    file_type="application/json",
+                    file_url=f"/api/v1/chats/{chat_id}/messages/{assistant.id}/attachments/{attachment_id}/download",
+                    size_bytes=len(json.dumps(workflow).encode("utf-8")),
+                )
+            )
         await session.commit()
 
 
@@ -187,6 +234,7 @@ async def _assistant_stream(
     chat_id: str,
     content: str,
     lock: asyncio.Lock,
+    user_message_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Run the agent on a new user message and stream the reply.
 
@@ -194,16 +242,21 @@ async def _assistant_stream(
     chunks become Text-Stream-Protocol chunks, custom status payloads are
     forwarded to keep the connection alive during long build/validate passes.
     Only assistant message text is buffered into the persisted row; status
-    lines are dropped from storage. Exactly one assistant Message row is
-    flushed once the stream finishes (or is aborted). The per-chat lock is
-    held for the whole run and released here, in the generator, because the
-    StreamingResponse iterates this generator after the handler returns.
+    lines are dropped from storage. Token usage is summed from the usage-
+    bearing chunks (every generation streams once, with totals on its final
+    chunk) and written to both the triggering user row and the assistant row.
+    Exactly one assistant Message row is flushed once the stream finishes (or
+    is aborted). The per-chat lock is held for the whole run and released
+    here, in the generator, because the StreamingResponse iterates this
+    generator after the handler returns.
     """
     agent = request.app.state.agent
     config = await _agent_config(chat_id)
     buffer: list[str] = []
     is_error = False
     request_task = asyncio.current_task()
+    in_tokens = 0
+    out_tokens = 0
     try:
         async for event in agent.astream(
             {"messages": [HumanMessage(content=content)]},
@@ -221,6 +274,11 @@ async def _assistant_stream(
                 if text:
                     buffer.append(text)
                     yield text
+                chunk_in, chunk_out = _chunk_usage(payload[0])
+                if chunk_in is not None:
+                    in_tokens += chunk_in
+                if chunk_out is not None:
+                    out_tokens += chunk_out
     except BaseException:
         is_error = True
         raise
@@ -232,16 +290,22 @@ async def _assistant_stream(
             context_summary = None
             if meta.get("phase") == "confirm":
                 context_summary = reply or None
+            kwargs = {
+                "chat_id": chat_id,
+                "content": reply,
+                "is_error": is_error,
+                "meta": meta,
+                "context_summary": context_summary,
+                "user_message_id": user_message_id,
+                "parent_id": user_message_id,
+                "input_tokens": in_tokens or None,
+                "output_tokens": out_tokens or None,
+            }
             if request_task is not None and request_task.cancelling():
-                _fire_and_forget(
-                    _flush_assistant_row(
-                        chat_id, reply, is_error=True, meta=meta, context_summary=context_summary
-                    )
-                )
+                kwargs["is_error"] = True
+                _fire_and_forget(_flush_assistant_row(**kwargs))
             else:
-                await _flush_assistant_row(
-                    chat_id, reply, is_error, meta=meta, context_summary=context_summary
-                )
+                await _flush_assistant_row(**kwargs)
         finally:
             lock.release()
 
@@ -252,6 +316,7 @@ async def _approve_stream(
     approved: bool,
     feedback: str | None,
     lock: asyncio.Lock,
+    parent_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Resume an interrupted run with the approval decision and stream the result."""
     agent = request.app.state.agent
@@ -259,6 +324,8 @@ async def _approve_stream(
     buffer: list[str] = []
     is_error = False
     request_task = asyncio.current_task()
+    in_tokens = 0
+    out_tokens = 0
     try:
         async for event in agent.astream(
             Command(resume={"approved": approved, "feedback": feedback}),
@@ -276,6 +343,11 @@ async def _approve_stream(
                 if text:
                     buffer.append(text)
                     yield text
+                chunk_in, chunk_out = _chunk_usage(payload[0])
+                if chunk_in is not None:
+                    in_tokens += chunk_in
+                if chunk_out is not None:
+                    out_tokens += chunk_out
     except BaseException:
         is_error = True
         raise
@@ -284,12 +356,20 @@ async def _approve_stream(
             reply = await _final_assistant_text(agent, config) or "".join(buffer)
             meta, meta_is_error = await _run_meta(agent, config)
             is_error = is_error or meta_is_error
+            kwargs = {
+                "chat_id": chat_id,
+                "content": reply,
+                "is_error": is_error,
+                "meta": meta,
+                "parent_id": parent_id,
+                "input_tokens": in_tokens or None,
+                "output_tokens": out_tokens or None,
+            }
             if request_task is not None and request_task.cancelling():
-                _fire_and_forget(
-                    _flush_assistant_row(chat_id, reply, is_error=True, meta=meta)
-                )
+                kwargs["is_error"] = True
+                _fire_and_forget(_flush_assistant_row(**kwargs))
             else:
-                await _flush_assistant_row(chat_id, reply, is_error, meta=meta)
+                await _flush_assistant_row(**kwargs)
         finally:
             lock.release()
 
@@ -307,6 +387,7 @@ async def list_messages(
     rows = (
         await session.execute(
             select(Message)
+            .options(selectinload(Message.attachments))
             .where(where)
             .order_by(Message.created_at.asc(), Message.id.asc())
             .offset((params.page - 1) * params.page_size)
@@ -358,21 +439,23 @@ async def send_message(
                     detail="Parent message does not belong to this chat",
                 )
 
-        session.add(
-            Message(
-                chat_id=chat.id,
-                role="user",
-                content=payload.content,
-                parent_id=payload.parent_id,
-            )
+        user_message = Message(
+            chat_id=chat.id,
+            role="user",
+            content=payload.content,
+            parent_id=payload.parent_id,
         )
+        session.add(user_message)
         await session.commit()
+        await session.refresh(user_message)
     except BaseException:
         lock.release()
         raise
 
     return StreamingResponse(
-        _assistant_stream(request, chat.id, payload.content, lock),
+        _assistant_stream(
+            request, chat.id, payload.content, lock, user_message_id=user_message.id
+        ),
         media_type="text/plain; charset=utf-8",
     )
 
@@ -429,6 +512,59 @@ async def approve(
         raise
 
     return StreamingResponse(
-        _approve_stream(request, chat.id, payload.approved, payload.feedback, lock),
+        _approve_stream(
+            request, chat.id, payload.approved, payload.feedback, lock, parent_id=pending.id
+        ),
         media_type="text/plain; charset=utf-8",
+    )
+
+
+@router.get("/{chat_id}/messages/{message_id}/attachments/{attachment_id}/download")
+async def download_attachment(
+    message_id: str,
+    attachment_id: str,
+    chat: Chat = Depends(get_owned_chat),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Serve a stored workflow attachment from the owning message's meta.
+
+    The final validated workflow JSON lives in Message.meta (DB-persisted, so
+    it survives the ephemeral Railway disk); this endpoint streams it back as
+    an application/json download so the file_url on the Attachment row is
+    actionable without any object storage.
+    """
+    message = (
+        await session.execute(
+            select(Message).where(Message.id == message_id, Message.chat_id == chat.id)
+        )
+    ).scalar_one_or_none()
+    if message is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Message not found",
+        )
+    attachment = (
+        await session.execute(
+            select(Attachment).where(
+                Attachment.id == attachment_id, Attachment.message_id == message_id
+            )
+        )
+    ).scalar_one_or_none()
+    if attachment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment not found",
+        )
+    workflow = message.meta.get("workflow_json")
+    if workflow is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workflow payload not available",
+        )
+    return Response(
+        content=json.dumps(workflow, indent=2),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{attachment.file_name}"',
+        },
     )

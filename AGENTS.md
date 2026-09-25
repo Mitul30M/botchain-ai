@@ -39,8 +39,13 @@ workflow) plus a concurrent-build isolation smoke, plus a real HTTP+Neon DB-pers
 (chat `db-persistence-test-ollama-model-e2e`, 7 message rows persisted incl. phase=confirm
 approval + phase=done workflow_json; found & fixed a confirm-flush precedence bug that dropped
 the pending-approval row). Non-inline, modular prompts now live in `src/app/prompts/`
-(plan/build/repair + guardrails); root `prompts/` remains a prototype-only placeholder;
-next: Phase 6 (streaming).
+(plan/build/repair + guardrails); root `prompts/` remains a prototype-only placeholder.
+Phase 5 follow-ups (also verified live, 38 pytest green): per-message `input_tokens`/
+`output_tokens` summed from streamed `usage_metadata`; `parent_id` chaining on assistant
+replies (+ approve continuation → pending confirm msg); validated final workflow delivered
+as an `Attachment` row served from `Message.meta` via a download route. Message-level
+lineage works; **agent-level thread forking is not implemented** (one linear thread per
+chat). next: Phase 6 (streaming).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -83,7 +88,7 @@ Each phase must be **verified working** before the next begins.
 | 2 | Auth | `core/security.py` Kinde JWT verification via JWKS (`<issuer>/.well-known/jwks.json`, cached); `deps.py` `current_user` (sub→User **read-only**, per-request cache, **401 if no User row** — no get-or-create) | Test JWT passes/fails against stub JWKS | Done (18 pytest cases green: minted RS256 JWTs vs mocked JWKS + read-only current_user; live JWKS fetch OK) |
 | 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Done (pool-based factory, 4 tables in Neon, Alembic exclusion verified) |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Done (all routes smoky green against live Neon: create/list/get/rename, happy+disconnect streams (is_error row persisted), approve 409+round-trip, 404s, soft-delete; ruff + 23 pytest green; disconnect flush is a strongly-referenced fire-and-forget task with logged failures) |
-| 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green; HTTP+Neon DB-persistence e2e green; prompts modularized into `src/app/prompts/`) |
+| 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green; HTTP+Neon DB-persistence e2e green; prompts modularized into `src/app/prompts/`; follow-ups green: per-message `input_tokens`/`output_tokens` from streamed usage, `parent_id` chaining, final workflow as `Attachment` row + download route — 38 pytest) |
 | 6 | Streaming | Message route returns StreamingResponse (Vercel AI SDK **Text Stream Protocol**, plain chunks) | Incremental tokens over curl | Not started |
 | 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
 | 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
@@ -165,6 +170,7 @@ GET/PATCH/DELETE /api/v1/chats/{chat_id}      read / rename / soft-delete
 GET    /api/v1/chats/{chat_id}/messages       history (resume)
 POST   /api/v1/chats/{chat_id}/messages       send message → streaming text response
 POST   /api/v1/chats/{chat_id}/approve        resume interrupted graph (approved + feedback)
+GET    /api/v1/chats/{chat_id}/messages/{message_id}/attachments/{attachment_id}/download   workflow file download (served from Message.meta)
 GET    /api/v1/credits                        stub (balance)
 POST   /api/v1/webhooks/...                    stub (payments — Razorpay later)
 ```

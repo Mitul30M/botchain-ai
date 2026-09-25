@@ -2,7 +2,12 @@
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.api.v1.messages import _final_assistant_text, _flush_assistant_row
+from app.api.v1.messages import (
+    _chunk_usage,
+    _final_assistant_text,
+    _flush_assistant_row,
+)
+from app.models import Attachment
 
 
 class _FakeState:
@@ -78,6 +83,7 @@ class _FakeSession:
         self._added = []
         self.committed = False
         self.queried = False
+        self.updated = []
 
     async def execute(self, stmt):
         self.queried = True
@@ -85,6 +91,11 @@ class _FakeSession:
 
     def add(self, message):
         self._added.append(message)
+
+    async def flush(self):
+        for row in self._added:
+            if getattr(row, "id", None) is None:
+                row.id = f"{type(row).__name__.lower()}-{self._added.index(row) + 1}"
 
     async def commit(self):
         self.committed = True
@@ -125,3 +136,46 @@ async def test_flush_assistant_row_without_summary_does_not_query_chat(monkeypat
     assert session.queried is False
     assert session.committed is True
     assert session._added[0].role == "assistant"
+
+
+async def test_chunk_usage_extracts_input_and_output():
+    chunk = AIMessage(
+        content="",
+        usage_metadata={"input_tokens": 25, "output_tokens": 16, "total_tokens": 41},
+    )
+    assert _chunk_usage(chunk) == (25, 16)
+
+
+async def test_chunk_usage_none_without_metadata():
+    chunk = AIMessage(content="mid-stream")
+    assert _chunk_usage(chunk) == (None, None)
+
+
+async def test_flush_assistant_row_done_creates_attachment(monkeypatch):
+    chat = _FakeChat("chat-1")
+    session = _FakeSession(chat)
+    monkeypatch.setattr("app.api.v1.messages.get_session_factory", lambda: lambda: session)
+
+    meta = {
+        "phase": "done",
+        "validation": {"status": "valid", "errors": []},
+        "workflow_json": {"name": "Webhook and Slack"},
+        "workflow_name": "workflow.json",
+    }
+    await _flush_assistant_row("chat-1", "done reply", False, meta=meta)
+
+    attachments = [row for row in session._added if isinstance(row, Attachment)]
+    assert len(attachments) == 1
+    assert attachments[0].file_type == "application/json"
+    assert attachments[0].file_name == "workflow.json"
+    assert attachments[0].message_id == session._added[0].id
+    assert attachments[0].file_url.startswith("/api/v1/chats/chat-1/messages/")
+
+
+async def test_flush_assistant_row_skips_attachment_without_workflow(monkeypatch):
+    session = _FakeSession(None)
+    monkeypatch.setattr("app.api.v1.messages.get_session_factory", lambda: lambda: session)
+
+    await _flush_assistant_row("chat-1", "plan reply", False, meta={"phase": "plan"})
+
+    assert all(not isinstance(row, Attachment) for row in session._added)
