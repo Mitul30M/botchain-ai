@@ -108,8 +108,8 @@ async def _flush_assistant_row(
             chat = (
                 await session.execute(
                     select(Chat).where(Chat.id == chat_id)
-                ).scalar_one_or_none()
-            )
+                )
+            ).scalar_one_or_none()
             if chat is not None and not chat.context_summary:
                 chat.context_summary = context_summary
         session.add(
@@ -225,23 +225,25 @@ async def _assistant_stream(
         is_error = True
         raise
     finally:
-        reply = await _final_assistant_text(agent, config) or "".join(buffer)
-        meta, meta_is_error = await _run_meta(agent, config)
-        is_error = is_error or meta_is_error
-        context_summary = None
-        if meta.get("phase") == "confirm":
-            context_summary = reply or None
-        if request_task is not None and request_task.cancelling():
-            _fire_and_forget(
-                _flush_assistant_row(
-                    chat_id, reply, is_error=True, meta=meta, context_summary=context_summary
+        try:
+            reply = await _final_assistant_text(agent, config) or "".join(buffer)
+            meta, meta_is_error = await _run_meta(agent, config)
+            is_error = is_error or meta_is_error
+            context_summary = None
+            if meta.get("phase") == "confirm":
+                context_summary = reply or None
+            if request_task is not None and request_task.cancelling():
+                _fire_and_forget(
+                    _flush_assistant_row(
+                        chat_id, reply, is_error=True, meta=meta, context_summary=context_summary
+                    )
                 )
-            )
-        else:
-            await _flush_assistant_row(
-                chat_id, reply, is_error, meta=meta, context_summary=context_summary
-            )
-        lock.release()
+            else:
+                await _flush_assistant_row(
+                    chat_id, reply, is_error, meta=meta, context_summary=context_summary
+                )
+        finally:
+            lock.release()
 
 
 async def _approve_stream(
@@ -278,16 +280,18 @@ async def _approve_stream(
         is_error = True
         raise
     finally:
-        reply = await _final_assistant_text(agent, config) or "".join(buffer)
-        meta, meta_is_error = await _run_meta(agent, config)
-        is_error = is_error or meta_is_error
-        if request_task is not None and request_task.cancelling():
-            _fire_and_forget(
-                _flush_assistant_row(chat_id, reply, is_error=True, meta=meta)
-            )
-        else:
-            await _flush_assistant_row(chat_id, reply, is_error, meta=meta)
-        lock.release()
+        try:
+            reply = await _final_assistant_text(agent, config) or "".join(buffer)
+            meta, meta_is_error = await _run_meta(agent, config)
+            is_error = is_error or meta_is_error
+            if request_task is not None and request_task.cancelling():
+                _fire_and_forget(
+                    _flush_assistant_row(chat_id, reply, is_error=True, meta=meta)
+                )
+            else:
+                await _flush_assistant_row(chat_id, reply, is_error, meta=meta)
+        finally:
+            lock.release()
 
 
 @router.get("/{chat_id}/messages", response_model=Paginated[MessageOut])

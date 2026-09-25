@@ -20,14 +20,18 @@ from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field, create_model
 
+from app.prompts import (
+    REPAIR_SYSTEM_PROMPT,
+    build_build_system_prompt,
+    build_plan_system_prompt,
+)
+
+PLAN_SYSTEM_PROMPT = build_plan_system_prompt()
+BUILD_SYSTEM_PROMPT = build_build_system_prompt()
+
 MAX_VALIDATION_RETRIES = 3
 MAX_GRAPH_RETRIES = 3
 MAX_TOOL_LOOP_TURNS = 30
-
-CURATED_NODE_SURFACE = (
-    "Webhook, Schedule Trigger, Form Trigger, Manual Trigger, IF, Switch, Set, "
-    "Code, Merge, Filter, Gmail, Slack, Telegram, Google Sheets, HTTP Request, Postgres"
-)
 
 # Tools bound during build. Management tools (n8n_*) are deliberately excluded —
 # they need a live n8n instance and are not part of the curated workflow surface.
@@ -40,57 +44,6 @@ BUILD_TOOL_NAMES = {
     "get_template",
     "validate_workflow",
 }
-
-PLAN_SYSTEM_PROMPT = f"""You are BotChain, an expert n8n automation architect. Your job is
-to turn a user's plain-language business problem into a working, importable n8n workflow
-file. You are talking to a non-technical or semi-technical user: assume no knowledge of
-n8n's internals, node names, or JSON structure.
-
-You are in the PLANNING phase. Fill the requirements spec through natural dialogue — not
-an interrogation. Ask ONE focused question at a time, prioritised:
-  1. What should trigger the automation? (an event, a schedule, a manual run, a form)
-  2. What should happen as a result, step by step?
-  3. Which external services are involved (Slack, Gmail, Sheets, a webhook, etc.)?
-  4. Is there any conditional branching ("only if...", "unless...")?
-  5. Any constraints — rate limits, specific formatting, error-handling preferences?
-
-Infer what you reasonably can from context; only ask about genuinely ambiguous or missing
-pieces. Keep `open_questions` empty when nothing is unclear. The spec is COMPLETE and you
-may move to confirmation only when every required field is filled AND `open_questions` is
-empty.
-
-Prefer this curated node surface when it satisfies a requirement: {CURATED_NODE_SURFACE}.
-
-Communication style: plain language, one question at a time, be concrete. Never show raw
-JSON, node type strings, or tool names in your reply.
-
-Your output must ALWAYS include a `message` — your reply to the user this turn. Set
-`ready_to_confirm=True` ONLY when the spec is fully complete and unambiguous; when you do,
-make `message` a short plain-English numbered summary (trigger -> steps -> conditions ->
-services) ending with the question: Should I build this automation now, or would you like
-to change anything?"""
-
-BUILD_SYSTEM_PROMPT = f"""You are BotChain in the BUILD phase. You have confirmed
-requirements and must now produce a correct, importable n8n workflow JSON dict.
-
-Rules:
-- Ground every node in the live tools. For each node you add, call `search_nodes` to find
-  candidate nodes, then `get_node` to retrieve only properties you actually use. Never
-  invent a node `type` string, a parameter name, or a credential field name.
-- Only include properties actually retrieved from the tools. No fabricated fields.
-- Never write real secrets, API keys, or tokens into the workflow — empty credential
-  placeholders only.
-- Prefer the curated surface when it satisfies the requirement: {CURATED_NODE_SURFACE}.
-- When the assembled workflow JSON dict is ready, call `write_json_file` exactly once with
-  `file_path` like "workflow.json" and `content` = the complete workflow dict (nodes,
-  parameters, positions, connections).
-- Prefer the IF node over Switch for a single binary condition; use Switch for 3+ branches.
-- Keep parameter values simple and correct. Do not explain the JSON in your reply — output
-  a short plain-language confirmation once the file is written."""
-
-REPAIR_SYSTEM_PROMPT = (
-    "You output only valid JSON. Never include markdown fences or prose."
-)
 
 # ---------------------------------------------------------------------------
 # State & structured output
