@@ -52,7 +52,7 @@ sandbox/
 
 store/
 
-_markdown/
+# _markdown/
 _nextjs_repo_context/
 
 # interview prep notes

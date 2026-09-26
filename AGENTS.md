@@ -45,7 +45,14 @@ Phase 5 follow-ups (also verified live, 38 pytest green): per-message `input_tok
 replies (+ approve continuation → pending confirm msg); validated final workflow delivered
 as an `Attachment` row served from `Message.meta` via a download route. Message-level
 lineage works; **agent-level thread forking is not implemented** (one linear thread per
-chat). next: Phase 6 (streaming).
+chat). Phase 6 (streaming) done — the message/approve routes now stream the AI SDK v7
+**Data Stream Protocol** (UI Message Stream, `x-vercel-ai-ui-message-stream: v1`):
+`start` → transient `data-status` heartbeats → `text-delta` reply → `finish` → `[DONE]`,
+consumed by `useChat` with zero config. Encoder in `src/app/streaming.py`, 43 pytest
+green. See `_markdown/phase6/backend-phase6-plan.md` for the wire spec + the reasoning
+that traded the checklist's "Text Stream Protocol first" for DSP (status heartbeats
+can't ride a plain-text stream; the frontend already speaks DSP by default).
+next: Phase 7 (sandbox/files).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -89,7 +96,7 @@ Each phase must be **verified working** before the next begins.
 | 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Done (pool-based factory, 4 tables in Neon, Alembic exclusion verified) |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Done (all routes smoky green against live Neon: create/list/get/rename, happy+disconnect streams (is_error row persisted), approve 409+round-trip, 404s, soft-delete; ruff + 23 pytest green; disconnect flush is a strongly-referenced fire-and-forget task with logged failures) |
 | 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green; HTTP+Neon DB-persistence e2e green; prompts modularized into `src/app/prompts/`; follow-ups green: per-message `input_tokens`/`output_tokens` from streamed usage, `parent_id` chaining, final workflow as `Attachment` row + download route — 38 pytest) |
-| 6 | Streaming | Message route returns StreamingResponse (Vercel AI SDK **Text Stream Protocol**, plain chunks) | Incremental tokens over curl | Not started |
+| 6 | Streaming | Message/approve routes return SSE in the AI SDK v7 **Data Stream Protocol** (UI Message Stream, `x-vercel-ai-ui-message-stream: v1`); statuses as transient `data-status` parts | `useChat` consumes it with zero config; wire-verified against the installed SDK reader; 43 pytest green | Done (decided DSP over the checklist's Text-Stream-first on evidence — see `_markdown/phase6/backend-phase6-plan.md`) |
 | 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
 | 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
 | 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for `npx n8n-mcp`); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main) | `docker build` passes locally | Not started |
@@ -110,8 +117,11 @@ Each phase must be **verified working** before the next begins.
   conversation memory uses `Chat.context_summary` (no extra table).
 - **Approval gate:** LangGraph `interrupt()` surfaced through `POST /api/v1/chats/{id}/approve`;
   UI approval actions come in the frontend phase.
-- **Streaming:** Text Stream Protocol first (plain incremental text); upgrade to the Data
-  Stream Protocol later for tool-call/reasoning indicators.
+- **Streaming:** **Data Stream Protocol** (AI SDK v7 UI Message Stream,
+  `x-vercel-ai-ui-message-stream: v1`, SSE). Statuses ride as transient `data-status`
+  parts; `useChat` consumes it with zero config. Text Stream Protocol remains only a
+  future option for `/completion`-style endpoints with no status data. (Decided
+  2026-09-26 — amends the earlier "text-first" decision; see the Phase 6 plan.)
 - **Sandbox/state:** single Railway replica; sandbox is per-turn scratch; workflow JSON
   persisted to `Message.meta` at the end of each build.
 - **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,

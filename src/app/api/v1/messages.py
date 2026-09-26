@@ -16,6 +16,7 @@ from app.deps import get_owned_chat, paginate
 from app.models import Attachment, Chat, Message, new_id
 from app.schemas.common import PageParams, Paginated
 from app.schemas.message import ApproveRequest, MessageCreate, MessageOut
+from app.streaming import UI_STREAM_HEADERS, _ui_stream
 
 router = APIRouter()
 
@@ -235,12 +236,13 @@ async def _assistant_stream(
     content: str,
     lock: asyncio.Lock,
     user_message_id: str | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str]]:
     """Run the agent on a new user message and stream the reply.
 
     Consumes the LangGraph stream in ["messages", "custom"] mode: message
-    chunks become Text-Stream-Protocol chunks, custom status payloads are
-    forwarded to keep the connection alive during long build/validate passes.
+    chunks stream as assistant reply text, custom status payloads are tagged so
+    the UI-message-stream encoder can forward them as live-only data-status
+    parts (keeping the connection alive through long build/validate passes).
     Only assistant message text is buffered into the persisted row; status
     lines are dropped from storage. Token usage is summed from the usage-
     bearing chunks (every generation streams once, with totals on its final
@@ -267,13 +269,13 @@ async def _assistant_stream(
             if mode == "custom":
                 status_text = _status_text(payload)
                 if status_text:
-                    yield status_text
+                    yield ("status", status_text)
                 continue
             if isinstance(payload, tuple) and isinstance(payload[0], AIMessage):
                 text = _content_text(payload[0])
                 if text:
                     buffer.append(text)
-                    yield text
+                    yield ("text", text)
                 chunk_in, chunk_out = _chunk_usage(payload[0])
                 if chunk_in is not None:
                     in_tokens += chunk_in
@@ -317,7 +319,7 @@ async def _approve_stream(
     feedback: str | None,
     lock: asyncio.Lock,
     parent_id: str | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncIterator[tuple[str, str]]:
     """Resume an interrupted run with the approval decision and stream the result."""
     agent = request.app.state.agent
     config = await _agent_config(chat_id)
@@ -336,13 +338,13 @@ async def _approve_stream(
             if mode == "custom":
                 status_text = _status_text(payload)
                 if status_text:
-                    yield status_text
+                    yield ("status", status_text)
                 continue
             if isinstance(payload, tuple) and isinstance(payload[0], AIMessage):
                 text = _content_text(payload[0])
                 if text:
                     buffer.append(text)
-                    yield text
+                    yield ("text", text)
                 chunk_in, chunk_out = _chunk_usage(payload[0])
                 if chunk_in is not None:
                     in_tokens += chunk_in
@@ -453,10 +455,13 @@ async def send_message(
         raise
 
     return StreamingResponse(
-        _assistant_stream(
-            request, chat.id, payload.content, lock, user_message_id=user_message.id
+        _ui_stream(
+            _assistant_stream(
+                request, chat.id, payload.content, lock, user_message_id=user_message.id
+            )
         ),
-        media_type="text/plain; charset=utf-8",
+        media_type="text/event-stream",
+        headers=UI_STREAM_HEADERS,
     )
 
 
@@ -512,10 +517,13 @@ async def approve(
         raise
 
     return StreamingResponse(
-        _approve_stream(
-            request, chat.id, payload.approved, payload.feedback, lock, parent_id=pending.id
+        _ui_stream(
+            _approve_stream(
+                request, chat.id, payload.approved, payload.feedback, lock, parent_id=pending.id
+            )
         ),
-        media_type="text/plain; charset=utf-8",
+        media_type="text/event-stream",
+        headers=UI_STREAM_HEADERS,
     )
 
 
