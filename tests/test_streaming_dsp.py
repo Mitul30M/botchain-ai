@@ -101,6 +101,63 @@ async def test_ui_stream_errors_emit_error_chunk_and_re_raise():
     assert not any(e and e["type"] == "finish" for e in collected)
 
 
+async def test_ui_stream_fresh_text_part_id_per_segment():
+    events = await _collect_events(
+        _ui_stream(
+            _tagged(
+                ("status", "Planning…"),
+                ("text", "First answer. "),
+                ("status", "Assembling the workflow file…"),
+                ("text", "Second answer. "),
+                ("status", "Workflow validated. Done."),
+                ("text", "Final summary."),
+            )
+        )
+    )
+
+    segments = {}
+    segment_order = []
+    current_id = None
+    for e in events:
+        if e and e["type"] == "text-start":
+            current_id = e["id"]
+            segments.setdefault(current_id, [])
+            segment_order.append(current_id)
+        elif e and e["type"] == "text-delta":
+            assert e["id"] == current_id
+            segments[current_id].append(e["delta"])
+        elif e and e["type"] == "text-end":
+            assert e["id"] == current_id
+
+    assert len(segment_order) == 3
+    assert len(set(segment_order)) == 3, "reopened text segments must get fresh ids"
+
+    assert ["".join(segments[i]) for i in segment_order] == [
+        "First answer. ",
+        "Second answer. ",
+        "Final summary.",
+    ]
+
+    types = [e["type"] for e in events if e]
+    assert types == [
+        "start",
+        "data-status",
+        "text-start",
+        "text-delta",
+        "text-end",
+        "data-status",
+        "text-start",
+        "text-delta",
+        "text-end",
+        "data-status",
+        "text-start",
+        "text-delta",
+        "text-end",
+        "finish",
+    ]
+    assert events[-1] is None
+
+
 class _FakeState:
     def __init__(self, values, tasks=None):
         self.values = values

@@ -28,7 +28,8 @@ the backend plan is the source of truth for the wire format.
   `x-vercel-ai-ui-message-stream: v1` + `x-accel-buffering: no`.
 - Chunks: `{"type":"start"}`, `{"type":"data-status","data":{"status":"…"},
   "transient":true}` (progress heartbeats, live-only), `text-start` /
-  `text-delta` / `text-end` (the reply text, id `"0"`), `{"type":"finish",
+  `text-delta` / `text-end` (the reply text, **fresh uuid part id per text
+  segment** — never reuse, see backend plan §2), `{"type":"finish",
   "finishReason":"stop"}`, then `data: [DONE]`.
 - Pre-stream HTTP errors are JSON `{"detail": "…"}` (409 = chat awaiting
   approval, 404 chat, 401 auth). In-stream errors: `{"type":"error",
@@ -64,8 +65,26 @@ the backend plan is the source of truth for the wire format.
 5. **Error mapping:** `res.status !== 200` (4xx) → return JSON `{ error: {
    message: <backend detail> } }` with same status so `useChat`'s `error`
    surfaces it cleanly.
-6. **Remove `export const maxDuration = 30`.** A build+validate run legitimately
-   runs minutes (n8n-mcp lookups, Ollama generations). No cap.
+6. **Set `maxDuration` explicitly — do not delete it.** Removing the export does
+   **not** mean "unlimited": the function reverts to the plan default, and every
+   plan still enforces a **hard ceiling** that kills the invocation outright with
+   `504 FUNCTION_INVOCATION_TIMEOUT`. It counts the *total* request + streamed-response
+   time — a distinct mechanism from any idle timeout the status heartbeats handle.
+   Phase 5 live runs show **~135 s+ worst case** (one run streamed ~97k input tokens
+   across build + repair passes). Concretely:
+   - Put `export const maxDuration = 300;` in each proxy route (300 s covers ~135 s
+     builds with headroom and is the floor to target).
+   - Ceilings as of 2026-09 (verify against
+     https://vercel.com/docs/functions/limitations — they've changed before):
+     with **Fluid Compute** (default on new projects) the default is 300 s on all
+     plans; max per plan is Hobby 300 s (not configurable above), Pro/Enterprise
+     800 s, extended 1800 s (beta, per-function). On a **non-Fluid** deployment
+     (project predates 2025-04-23, or Fluid disabled) the ceilings are far lower —
+     Hobby default 10 s / max 60 s, Pro default 15 s / max 300 s — and there a
+     135 s build is **impossible on Hobby at any setting**.
+   - Check which compute mode the project actually runs before relying on any of
+     these; the safe statement is "300 s floor, plan ceiling verified ≥ worst-case
+     build time", not "no cap".
 
 ## 4. New proxy routes (small, all token-forwarded)
 
@@ -130,6 +149,12 @@ init)`) so the 4 routes don't each repeat the Kinde/fetch plumbing.
    `meta.phase === "done"` message + attachment; download works.
 5. Two users / two chats concurrently — streams stay isolated (backend per-chat
    lock).
+6. **Multi-status build run on the wire** (guards the fresh-text-part-id fix):
+   run a prompt whose build/validate pass emits several statuses between text
+   (or a graph that reopens text — e.g. an approve with a rejected-feedback
+   replan, then approval text). Capture the raw SSE and confirm: every `text-start`
+   carries a **distinct id**, and never a `text-delta` for segment N arriving after
+   `text-end` of segment N with a reused id; statuses only in `data-status` parts.
 
 ## 8. Backend↔frontend coordination notes (for the wiring session)
 

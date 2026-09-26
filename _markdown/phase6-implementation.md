@@ -4,7 +4,7 @@
 AI SDK v7 **Data Stream Protocol / UI Message Stream** (`x-vercel-ai-ui-message-stream: v1`)
 instead of a plain-text stream. Status heartbeats ride as transient `data-status`
 parts; the assistant reply streams as `text-delta` fragments; `useChat` consumes the
-whole thing with zero transport config. 43 pytest green (5 new DSP tests), ruff clean.
+whole thing with zero transport config. 44 pytest green (6 new DSP tests), ruff clean.
 
 ---
 
@@ -39,7 +39,7 @@ Full decision + wire spec: `_markdown/phase6/backend-phase6-plan.md`.
 | `UI_STREAM_HEADERS` | `content-type: text/event-stream`, `cache-control: no-cache`, `connection: keep-alive`, `x-vercel-ai-ui-message-stream: v1`, `x-accel-buffering: no` |
 | `_sse(payload)` | one `data: <json>\n\n` line; `json.dumps(..., ensure_ascii=False)` |
 | `_DONE_EVENT` | `data: [DONE]\n\n` terminator |
-| `_ui_stream(events)` | async generator: `("status", s)` → `data-status` part (`transient: true`, `data:{"status": s}`); `("text", t)` → `text-start`/`text-delta`…/`text-end` (`id:"0"`). `text-end` closes the text part before any interrupting status so deltas stay contiguous. Opens with `start`, closes with `finish{finishReason:"stop"}` + `[DONE]`. Exceptions from the inner iterator emit `{"type":"error","errorText":"…"}` then **re-raise**, so the caller's `finally` flush still runs and the row persists `is_error=True` |
+| `_ui_stream(events)` | async generator: `("status", s)` → `data-status` part (`transient: true`, `data:{"status": s}`); `("text", t)` → `text-start`/`text-delta`…/`text-end` with a **fresh uuid part id per text segment** (uuid counter; never reuse an id across segments or the SDK merges later prose into the earlier part — vercel/ai PR #15254-area). `text-end` closes the text part before any interrupting status so deltas stay contiguous. Opens with `start`, closes with `finish{finishReason:"stop"}` + `[DONE]`. Exceptions from the inner iterator emit `{"type":"error","errorText":"…"}` then **re-raise**, so the caller's `finally` flush still runs and the row persists `is_error=True` |
 
 ### 2.2 `src/app/api/v1/messages.py` (minimal diff)
 
@@ -59,9 +59,9 @@ x-vercel-ai-ui-message-stream: v1
 …
 data: {"type":"start"}
 data: {"type":"data-status","data":{"status":"Planning…"},"transient":true}
-data: {"type":"text-start","id":"0"}
-data: {"type":"text-delta","id":"0","delta":"…"}   # one per streamed fragment
-data: {"type":"text-end","id":"0"}
+data: {"type":"text-start","id":"<uuid>"}
+data: {"type":"text-delta","id":"<uuid>","delta":"…"}   # one per streamed fragment
+data: {"type":"text-end","id":"<uuid>"}
 data: {"type":"finish","finishReason":"stop"}
 data: [DONE]
 ```
@@ -74,7 +74,7 @@ frontend detects pending approval from the committed row's `meta.phase == "confi
 `{"type":"error","errorText":…}` (no `finish`/`[DONE]`); pre-stream HTTP errors
 (409/400/404) remain normal JSON.
 
-## 4. Tests — `tests/test_streaming_dsp.py` (5 new)
+## 4. Tests — `tests/test_streaming_dsp.py` (6 new)
 
 1. **Headers** — exact media type + guard headers, matching the SDK's own
    `UI_MESSAGE_STREAM_HEADERS`.
@@ -82,16 +82,21 @@ frontend detects pending approval from the committed row's `meta.phase == "confi
    start → data-status → text-start → text-delta → text-delta → text-end →
    data-status → finish → `[DONE]`; terminator exactly once; deltas concatenate to
    the full reply; status text never leaks into `text-delta`.
-3. **Statuses stay out of text** — a status-only stream yields no `text-*` parts.
-4. **Error path** — `error` chunk emitted (no `finish`, no `[DONE]`), exception
+3. **Fresh text-part ids** — status → text → status → text → status → text (text
+   closed by a status and *reopened* twice): every reopened segment gets a **distinct
+   id**; chunks within a segment share its id; each segment's deltas concatenate to its
+   own text. Guards the vercel/ai `id` reuse bug (later prose merging into the first
+   block).
+4. **Statuses stay out of text** — a status-only stream yields no `text-*` parts.
+5. **Error path** — `error` chunk emitted (no `finish`, no `[DONE]`), exception
    re-raised.
-5. **Full run via `_assistant_stream`** — fake agent + fake SQLAlchemy session: the
+6. **Full run via `_assistant_stream`** — fake agent + fake SQLAlchemy session: the
    decoded reply equals the persisted assistant row content + `meta`; per-chat lock
    released; commit happened (happy path, plus the existing error-path route tests
    assert the `is_error` row).
 
 The two pre-existing route-streaming tests were updated to the new media type and
-chunk-parsed bodies rather than asserting `text/plain`. `uv run pytest` → 43 passed;
+chunk-parsed bodies rather than asserting `text/plain`. `uv run pytest` → 44 passed;
 `uv run ruff check src tests` clean.
 
 ## 5. Docs updated
@@ -110,7 +115,10 @@ chunk-parsed bodies rather than asserting `text/plain`. `uv run pytest` → 43 p
 ## 6. Follow-ups (next phases)
 
 - **Live curl smoke + proxy e2e** — deferred to the frontend-phase wiring run (needs
-  seeded user, live Neon compute, Ollama + n8n-mcp up; owner runs it).
+  seeded user, live Neon compute, Ollama + n8n-mcp up; owner runs it). Must include a
+  **multi-status build run** while capturing the raw SSE: confirm each reopened
+  `text-start` carries a fresh part id (the `id`-reuse regression guarded by
+  `test_ui_stream_fresh_text_part_id_per_segment`).
 - **TSP uses in later phases** — only if a `/completion`-style endpoint with no status
   data ever appears; today every streamed endpoint carries statuses, so DSP everywhere.
 - **Tool-call/reasoning parts** — DSP's richer parts (`tool-call`, `reasoning`) are the

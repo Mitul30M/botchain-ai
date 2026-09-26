@@ -13,7 +13,7 @@ the three source-of-truth docs accordingly.
 
 ## 1. Goal
 
-> ✅ **Implemented + verified 2026-09-26** (43 pytest green, ruff clean;
+> ✅ **Implemented + verified 2026-09-26** (44 pytest green, ruff clean;
 > implementation record in `_markdown/phase6-implementation.md`).
 
 Both streaming endpoints — `POST /api/v1/chats/{chat_id}/messages` and
@@ -42,9 +42,9 @@ and reply text are user-visible UTF-8.
 ```
 data: {"type":"start"}                              # messageId optional → SDK auto-ids the assistant message
 data: {"type":"data-status","data":{"status":"Planning…"},"transient":true}
-data: {"type":"text-start","id":"0"}
-data: {"type":"text-delta","id":"0","delta":"..."}  # one per streamed text fragment
-data: {"type":"text-end","id":"0"}
+data: {"type":"text-start","id":"<uuid>"}
+data: {"type":"text-delta","id":"<uuid>","delta":"..."}  # one per streamed text fragment
+data: {"type":"text-end","id":"<uuid>"}
 data: {"type":"finish","finishReason":"stop"}
 data: [DONE]
 ```
@@ -71,7 +71,9 @@ data: [DONE]
   consumes tagged events `("status", text)` | `("text", text)` and encodes the
   DSP sequence: `{"type":"start"}` first, `data-status` (with `transient:true`
   and `data:{"status":...}`) for statuses, `text-start`/`text-delta`…/`text-end`
-  (fixed `"id":"0"`) around the text pieces, terminating `{"type":"finish",
+  (a **fresh uuid part id per text segment** — reusing one id across segments
+  would make the SDK merge later prose into the first block, see vercel/ai PR
+  #15254-area work) around the text pieces, terminating `{"type":"finish",
   "finishReason":"stop"}` + `[DONE]`. The text part is closed with `text-end`
   before any status interrupts it (keeps `text-delta` fragments contiguous per
   provider convention). Must not swallow exceptions — the flusher in the calling
@@ -109,9 +111,9 @@ data: [DONE]
 ## 4. Verification gate
 
 > ✅ **Green 2026-09-26.** Items 1–2 done in this phase:
-> `uv run pytest` → **43 passed** (38 existing, of which the two old route tests
+> `uv run pytest` → **44 passed** (38 existing, of which the two old route tests
 > were updated to assert the new `text/event-stream` + `x-vercel-ai-ui-message-stream: v1`
-> headers and chunk-parsed bodies, plus 5 new DSP tests), `uv run ruff check src tests`
+> headers and chunk-parsed bodies, plus 6 new DSP tests), `uv run ruff check src tests`
 > clean. Full description of the planned gate (kept for reference):
 
 1. `uv run pytest` — existing 38 stay green (the two old route tests that
@@ -132,9 +134,13 @@ data: [DONE]
    `curl -N -H "Authorization: Bearer …" -H "Content-Type: application/json"
    -d '{"content":"<a notebooks/testcases.md prompt>"}' 127.0.0.1:8734/api/v1/chats/<id>/messages`
    → observe SSE lines incl. `data-status` heartbeats + `text-delta` + `[DONE]`.
-   Also smoke `/approve` continuation. — **Deferred to the frontend-phase wiring
-   run** (requires a seeded user, live Neon compute, Ollama + n8n-mcp all up;
-   the repo-owner runs first-deploy smokes). Item 4 covers the client-side half.
+   Also smoke `/approve` continuation. **Exercise at least one multi-status run
+   watching the raw lines for the reopen path** (status interrupts open text, then
+   text resumes): each `text-start` must carry a **fresh id**, never a reuse —
+   this is the vercel/ai id-reuse regression the encoder fix guards. —
+   **Deferred to the frontend-phase wiring run** (requires a seeded user, live Neon
+   compute, Ollama + n8n-mcp all up; the repo-owner runs first-deploy smokes).
+   Item 4 covers the client-side half.
 4. End-to-end through the Next.js proxy (coordinated with the frontend plan):
    tokens render incrementally, status banner updates live, message persists,
    confirm→approve path streams the continuation, workflow attachment downloads.

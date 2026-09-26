@@ -245,12 +245,15 @@ Every chunk is one SSE `data:` line, UTF-8 — `data: <json>\n\n`. The sequence 
    `Fixing validation errors…`, `Workflow validated. Done.` There is **no
    "confirming" status** — the graph simply ends the stream at the approval gate;
    detect pending approval from the post-stream state (see below).
-3. The assistant reply as a text part — every chunk carries `"id":"0"`:
-   `{"type":"text-start","id":"0"}` → repeated
-   `{"type":"text-delta","id":"0","delta":"…"}` → `{"type":"text-end","id":"0"}`.
-   Concatenate the `delta` values for the full reply. If a status interrupts open
+3. The assistant reply as a text part — the id is a **fresh uuid per text segment**
+   (reopening after a status interruption must generate a new id, not reuse the
+   previous one, or the SDK merges the second segment into the first part):
+   `{"type":"text-start","id":"<uuid>"}` → repeated
+   `{"type":"text-delta","id":"<uuid>","delta":"…"}` → `{"type":"text-end","id":"<uuid>"}`.
+   Concatenate the `delta` values of one segment for its text. If a status interrupts open
    text (it never does today — the reply always streams last), the backend closes
-   `text-end` before the `data-status`, so deltas stay contiguous.
+   `text-end` before the `data-status`, so deltas stay contiguous and the reopened
+   segment gets a fresh id.
 4. `{"type":"finish","finishReason":"stop"}` then the terminal `data: [DONE]\n\n`.
 
 **Error mid-stream:** an `{"type":"error","errorText":"…"}` chunk then the socket
@@ -262,10 +265,17 @@ model calls (structured plan, build self-repair) stream status/`text` frames too
 the final committed text is the real message.
 
 Important constraint the route handler must respect:
-- **`maxDuration` of `30` will fail real runs.** The confirm→build→validate pipeline
-  routinely takes minutes (verified live: one run streamed ~97k input tokens over build
-  + repair passes). Raise/remove `maxDuration` (or use streamed/background execution) or
-  real requests will be killed mid-build.
+- **The proxy route needs an explicit `maxDuration` — do not just delete/omit it.**
+  The confirm→build→validate pipeline routinely takes minutes (verified live: one
+  run streamed ~97k input tokens over build + repair passes; ~135s+ worst case).
+  Omitting the export reverts to the plan default, not "unlimited", and every plan
+  still enforces a hard ceiling (`504 FUNCTION_INVOCATION_TIMEOUT`) counting total
+  request + streamed-response time — distinct from any idle timeout the status
+  heartbeats handle. Ceilings as of 2026-09: with Fluid Compute, default 300s on all
+  plans, Hobby max 300s / Pro+Enterprise max 800s (1800s beta); on non-Fluid
+  deployments Hobby is capped at 60s max, where a 135s build cannot run at any
+  setting. Set `maxDuration` to 300s+ and confirm the project's actual ceiling
+  (plan + Fluid on/off) ≥ worst-case build time — see the Phase 6 frontend plan.
 - A `plan`/`confirm` turn may pause at the **confirm gate**: `finish` + `[DONE]` arrive
   and the last committed assistant row has `meta.phase == "confirm"` with
   `approval.status == "pending"`. The UI must switch to the approve/reject affordance
