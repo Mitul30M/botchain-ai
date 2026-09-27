@@ -18,7 +18,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.types import Command, interrupt
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, ValidationError, create_model
 
 from app.prompts import (
     REPAIR_SYSTEM_PROMPT,
@@ -32,6 +32,12 @@ BUILD_SYSTEM_PROMPT = build_build_system_prompt()
 MAX_VALIDATION_RETRIES = 3
 MAX_GRAPH_RETRIES = 3
 MAX_TOOL_LOOP_TURNS = 30
+
+_PLAN_FALLBACK_RETRIES = 2
+_PLAN_DEGRADED_MESSAGE = (
+    "I had trouble turning that into a clean requirements plan. "
+    "Could you restate what you'd like to automate, in a sentence or two?"
+)
 
 # Tools bound during build. Management tools (n8n_*) are deliberately excluded —
 # they need a live n8n instance and are not part of the curated workflow surface.
@@ -292,7 +298,10 @@ async def _invoke_structured_with_retry(
     Ollama cloud's function-calling mode is unreliable: it occasionally returns
     prose instead of a tool call, and with long histories can return nothing at
     all. Strategy: retry structured output once with an explicit JSON directive,
-    then fall back to a plain completion parsed from the raw JSON text.
+    then fall back to a plain completion parsed from the raw JSON text — that
+    path is itself retried a couple of times, since empty replies are transient.
+    If the model still returns nothing parseable, degrade to a friendly
+    re-prompt instead of crashing the stream mid-run.
     """
     strict_prompt = (
         "Return ONLY a strict JSON object matching the requested schema. "
@@ -308,10 +317,19 @@ async def _invoke_structured_with_retry(
         except Exception:  # noqa: BLE001 - fall back to plain JSON on any structured failure
             if attempt == 0:
                 messages = [SystemMessage(content=strict_prompt), *messages]
-    response = await model.ainvoke(messages)
-    text = _extract_text_payload(response.content)
-    data = json.loads(_strip_code_fences(text))
-    return PlanOutput.model_validate(data)
+    for _ in range(_PLAN_FALLBACK_RETRIES):
+        response = await model.ainvoke(messages)
+        cleaned = _strip_code_fences(_extract_text_payload(response.content))
+        if not cleaned:
+            continue
+        try:
+            return PlanOutput.model_validate(json.loads(cleaned))
+        except (ValueError, ValidationError):
+            continue
+    return PlanOutput(
+        message=_PLAN_DEGRADED_MESSAGE,
+        ready_to_confirm=False,
+    )
 
 
 def _make_plan_node(plan_model, model):

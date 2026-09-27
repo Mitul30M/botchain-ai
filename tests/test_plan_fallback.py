@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 from langchain_core.messages import AIMessage
 
 from app.services.agent import (
@@ -84,12 +83,37 @@ async def test_fallback_includes_schema_in_prompt():
     assert any(PLAN_SCHEMA["title"] in c for c in captured)
 
 
-async def test_fallback_raises_on_invalid_json():
+async def test_fallback_degrades_gracefully_on_invalid_json():
     class _EarlyBoomPlanModel:
         async def ainvoke(self, messages):
             raise RuntimeError("boom")
 
-    with pytest.raises(ValueError):
-        await _invoke_structured_with_retry(
-            _EarlyBoomPlanModel(), _FakeModel("not json"), []
-        )
+    out = await _invoke_structured_with_retry(
+        _EarlyBoomPlanModel(), _FakeModel("not json"), []
+    )
+    assert isinstance(out, PlanOutput)
+    assert out.ready_to_confirm is False
+    assert out.goal is None
+
+
+async def test_fallback_degrades_gracefully_on_empty_reply():
+    out = await _invoke_structured_with_retry(_FakePlanModel(), _FakeModel(""), [])
+    assert isinstance(out, PlanOutput)
+    assert out.ready_to_confirm is False
+    assert out.message
+
+
+class _RecoveringModel:
+    def __init__(self, first, second):
+        self._replies = [first, second]
+
+    async def ainvoke(self, messages):
+        return AIMessage(content=self._replies.pop(0))
+
+
+async def test_fallback_retries_plain_path_before_degrading():
+    payload = {"message": "Recovered.", "ready_to_confirm": False, "goal": "g"}
+    out = await _invoke_structured_with_retry(
+        _FakePlanModel(), _RecoveringModel("not json", json.dumps(payload)), []
+    )
+    assert out.goal == "g"
