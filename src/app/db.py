@@ -1,9 +1,13 @@
+import logging
 from collections.abc import AsyncIterator
 
 from sqlalchemy import make_url
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _ASYNC_PG_DROP_KEYS = {"sslmode", "channel_binding", "uselibpqcompat"}
 
@@ -65,6 +69,19 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """Yield an AsyncSession for the lifetime of one request dependency."""
-    async with get_session_factory()() as session:
+    """Yield an AsyncSession for the lifetime of one request dependency.
+
+    Closing is best-effort: by the time a long-lived request is torn down
+    (one that bridged a multi-minute streaming response), the underlying DB
+    connection may already be closed server-side, and rolling back has nothing
+    to do on a dead connection. The pool pre-pings before the next checkout,
+    so the dead connection is recycled without ceremony.
+    """
+    session = get_session_factory()()
+    try:
         yield session
+    finally:
+        try:
+            await session.close()
+        except DBAPIError:
+            logger.debug("session close skipped: DB connection already gone", exc_info=True)

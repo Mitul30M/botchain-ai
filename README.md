@@ -82,7 +82,7 @@ LangGraph tables), so `.env` must be present and `DATABASE_URL` pointed at the
 **`tests` Neon branch**, never production data.
 
 ```sh
-uv run pytest                    # whole suite (44 tests)
+uv run pytest                    # whole suite (51 tests)
 uv run pytest -k streaming       # a single area
 uv run pytest tests/test_security.py
 ```
@@ -167,7 +167,7 @@ consumes it with zero config. Full wire spec: `_markdown/backend-api-schema.md` 
 │   ├── core/                 security.py (Kinde JWKS), exceptions.py
 │   ├── streaming.py          Data Stream Protocol encoder
 │   └── prompts/              plan/build/repair + guardrails
-├── tests/                    pytest suite (44 tests)
+├── tests/                    pytest suite (51 tests)
 ├── alembic/                  migrations (zero-diff baseline only)
 ├── _markdown/                SOURCE OF TRUTH — checklist, settled decisions, plans, records
 ├── prototype/                working single-agent prototype (terminal UI, SQLite)

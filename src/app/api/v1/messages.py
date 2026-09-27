@@ -417,7 +417,6 @@ async def send_message(
     config = await _agent_config(chat.id)
     try:
         if await _has_pending_approval(agent, config):
-            lock.release()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="This chat is waiting for your approval — approve or reject the "
@@ -454,10 +453,13 @@ async def send_message(
         lock.release()
         raise
 
+    chat_id = chat.id
+    user_message_id = user_message.id
+    await session.close()
     return StreamingResponse(
         _ui_stream(
             _assistant_stream(
-                request, chat.id, payload.content, lock, user_message_id=user_message.id
+                request, chat_id, payload.content, lock, user_message_id=user_message_id
             )
         ),
         media_type="text/event-stream",
@@ -499,7 +501,6 @@ async def approve(
             None,
         )
         if pending is None:
-            lock.release()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="No pending approval for this chat",
@@ -516,10 +517,13 @@ async def approve(
         lock.release()
         raise
 
+    chat_id = chat.id
+    pending_id = pending.id
+    await session.close()
     return StreamingResponse(
         _ui_stream(
             _approve_stream(
-                request, chat.id, payload.approved, payload.feedback, lock, parent_id=pending.id
+                request, chat_id, payload.approved, payload.feedback, lock, parent_id=pending_id
             )
         ),
         media_type="text/event-stream",
