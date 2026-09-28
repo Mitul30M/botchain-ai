@@ -56,6 +56,20 @@ Expected: trigger + 3–4 nodes, one IF/Switch divergence or one Code/Set transf
 services. Watch the operator choice (numeric comparison, string-contains) — the agent
 must pick valid n8n option values, not paraphrase them.
 
+> **Easy #4 / Telegram broadcast — PASSED (chat `8862058a-e450-4ab8-a15b-4425d413ee9c`)**
+> Valid ScheduleTrigger (hour 7) → Telegram sendMessage; converged in 3 attempts on
+> ministral-14b.
+
+> **Medium #10 / Order-amount routing — PASSED validator, LOGIC GAP (chat `382d845f-b930-4f23-912b-c7b652995b21`)**
+> `validation.status: valid` after 3 attempts on ministral-14b. IF node used the correct
+> v2 condition object (`operator: {type: number, operation: lt}`); Set used the nested
+> `assignments: {assignments: [...]}` form; branches wired as `main: [[true],[false]]`.
+> **Gap**: `SendThankYouEmail` and `PostToSlack` are orphaned — `SetMessages` has no
+> outgoing connections, so $100+ orders run the Set node and stop. n8n's validator only
+> checks structure; the build/repair loop has no spec-vs-connections re-check. Punted;
+> candidate fix (not yet applied): structural coherence check in `validate_node` — every
+> non-trigger node must have an incoming connection, every IF/Switch branch reachable.
+
 ## Hard — multi-branch, dependent calls, error handling, 5+ nodes, 3+ services
 
 11. **Expense approval workflow**

@@ -21,6 +21,19 @@ Rules:
   `connections` is an OBJECT keyed by the SOURCE NODE'S NAME, and each target is
   referenced by its node name inside a `"main": [[...]]` array-of-arrays.
 - Prefer the IF node over Switch for a single binary condition; use Switch for 3+ branches.
+- IF node shape (v2, NOT the legacy field/value/valueType form): conditions are
+  `"conditions": {{"mode": "and", "conditions": [{{"id": "<uuid>", "leftValue": "={{ $json['field'] }}",
+  "rightValue": "<value>", "operator": {{"type": "number|string", "operation": "<op>"}}}}]}}`.
+  Number operations: gt, gte, lt, lte, equals, notEquals. String operations: equals,
+  notEquals, contains, notContains, startsWith, endsWith, regex. The IF node has exactly two
+  outputs, one inner array per output: `"main": [[true-branch-targets], [false-branch-targets]]` —
+  never use `true`/`false` as connection keys. When a branch feeds MULTIPLE downstream nodes,
+  all of them go in that branch's single inner array (spread your output nodes across the
+  same `main[N]`), and never nest arrays deeper than one per output.
+- Set node (v2+): assignments must be the nested collection form —
+  `"assignments": {{"assignments": [{{"id": "<uuid>", "name": "<field>", "value": "<value>"}}]}}`
+  (or `"values": [{{"id": "<uuid>", "name": "<field>", "value": "<value>"}}]`). A plain
+  `"assignments": {{...}}` object is invalid.
 - Keep parameter values simple and correct. Do not explain the JSON in your reply — output
   a short plain-language confirmation once the file is written.
 
