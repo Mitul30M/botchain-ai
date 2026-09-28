@@ -22,9 +22,14 @@ async def ckpt_service():
     yield svc
     from psycopg import AsyncConnection
 
-    async with await AsyncConnection.connect(svc._pool.conninfo, autocommit=True) as conn:
-        for table in _LANGGRAPH_TABLES:
-            await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+    # Only clean up LangGraph-owned tables when testing against a dedicated test
+    # branch. There is no tests-branch wiring yet (Phase 8), so we must NOT drop
+    # them against the live/dev DATABASE_URL — the running app's checkpointer
+    # would immediately point at missing tables.
+    if os.environ.get("TEST_CHECKPOINT_DROP_TABLES") == "1":
+        async with await AsyncConnection.connect(svc._pool.conninfo, autocommit=True) as conn:
+            for table in _LANGGRAPH_TABLES:
+                await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
     await svc.close()
 
 
