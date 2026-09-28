@@ -122,8 +122,11 @@ Each phase must be **verified working** before the next begins.
 
 ## Settled decisions (do not re-litigate without a reason)
 - **ORM:** SQLAlchemy 2.0 typed async models (NOT SQLModel).
-- **LLM:** Mistral (`ChatMistralAI`, `MISTRAL_API_KEY`) for now while models are being
-  evaluated — **behind `services/llm.py`** (the Ollama `ChatOllama` path is kept commented
+- **LLM:** Mistral `ministral-14b-latest` (`ChatMistralAI`, `MISTRAL_API_KEY`) — the
+  largest model reachable on the free API tier (verified 2026-09-28: ministral-3b/8b/14b
+  are 200 + clean tool calls; `mistral-small/medium-latest` → 429 (0 req/min),
+  `mistral-large-latest` → 403 "not in tier"; `open-mistral-nemo` works but is deprecated)
+  — **behind `services/llm.py`** (the Ollama `ChatOllama` path is kept commented
   in that file; swapping providers touches one file only). New chats store the **real model
   name** (`services/llm.py` `MODEL_NAME`) in `Chat.model` at creation — not the DB's
   `claude-sonnet-4-6` placeholder.

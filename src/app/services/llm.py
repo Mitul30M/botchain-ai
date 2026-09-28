@@ -9,11 +9,12 @@ from app.config import get_settings
 # _OLLAMA_MODEL = "gemma4:cloud"
 # _OLLAMA_BASE_URL = "https://ollama.com"
 
-# Mistral — candidate names to try for this project (verified 2026-09-28 on the
-# free API tier: mistral-small-latest -> 429 (0 req/min), mistral-large-latest
-# -> 403 "not available", so use the open models below — both 200, ~188 req/min):
-#   ministral-8b-latest, open-mistral-nemo (open-mistral-7b)
-_MISTRAL_MODEL = "ministral-8b-latest"
+# Mistral — available models on the free API tier (verified 2026-09-28):
+#   ministral-3b/8b/14b-latest -> 200 (~188 req/min), clean tool_calls
+#   open-mistral-nemo          -> 200 but deprecated (retire 7/31/2026)
+#   mistral-small/medium-latest -> 429 (0 req/min), mistral-large-latest -> 403
+#   (gated behind a plan upgrade — would be Small 4 / Medium 3.5 / Large 3)
+_MISTRAL_MODEL = "ministral-14b-latest"
 
 # Public name of the model in use — stored on each Chat.model at creation so the
 # UI shows the real model instead of the DB's "claude-sonnet-4-6" placeholder.
