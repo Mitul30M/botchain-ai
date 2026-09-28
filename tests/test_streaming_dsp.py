@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage
 
-from app.api.v1.messages import _assistant_stream, _chat_lock
+from app.api.v1.messages import _assistant_stream
+from app.services.chat_locks import get_chat_lock
 from app.streaming import UI_STREAM_HEADERS, _ui_stream
 
 
@@ -227,7 +228,7 @@ async def test_assistant_stream_full_run_decodes_to_persisted_text(monkeypatch):
     request = SimpleNamespace(
         app=SimpleNamespace(state=SimpleNamespace(agent=agent))
     )
-    lock = _chat_lock("chat-1")
+    lock = get_chat_lock("chat-1")
     await lock.acquire()
 
     events = await _collect_events(

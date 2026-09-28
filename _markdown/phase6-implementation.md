@@ -4,7 +4,7 @@
 AI SDK v7 **Data Stream Protocol / UI Message Stream** (`x-vercel-ai-ui-message-stream: v1`)
 instead of a plain-text stream. Status heartbeats ride as transient `data-status`
 parts; the assistant reply streams as `text-delta` fragments; `useChat` consumes the
-whole thing with zero transport config. 51 pytest green (6 new DSP tests + 7 session-release regressions), ruff clean.
+whole thing with zero transport config. 64 pytest green (6 new DSP tests + 7 session-release regressions + chat lifecycle/account purge), ruff clean.
 
 ---
 

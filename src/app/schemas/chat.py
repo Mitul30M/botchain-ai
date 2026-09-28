@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ChatCreate(BaseModel):
@@ -9,7 +9,15 @@ class ChatCreate(BaseModel):
 
 
 class ChatUpdate(BaseModel):
-    title: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must not be empty after trimming whitespace")
+        return value
 
 
 class ChatOut(BaseModel):

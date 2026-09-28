@@ -59,6 +59,17 @@ server-closed connection at dependency teardown — `InterfaceError: cannot call
 Transaction.rollback()`); `get_session` teardown is additionally guarded against a
 dead connection, and the send/approve 409 branches no longer double-release the
 per-chat lock (a `RuntimeError` that masked the 409). 7 regression tests added.
+The plan-node emptiness crash is also fixed: `_invoke_structured_with_retry`
+retries a bare-completion reply twice and degrades gracefully to a re-prompt
+instead of raising on empty/unparseable output. **54 pytest green through all
+Phase-6 follow-ups.** Then **chat lifecycle + account purge (Phase 6.6)**: the
+per-chat lock registry moved to `services/chat_locks.py` (`get_chat_lock` /
+`drop_chat_lock`); rename now strips + caps titles at 120 chars and bumps
+`updated_at`; soft-delete returns **409** while a stream holds the chat's lock;
+`DELETE /api/v1/me/data` purges the current user's chats (incl. soft-deleted),
+LangGraph checkpoint threads (via `adelete_thread`, before the rows), messages,
+attachments, and billing rows in one transaction — never touching `users`.
+**64 pytest green, ruff clean.** See `_markdown/phase6.6/backend-lifecycle-plan.md`.
 next: Phase 7 (sandbox/files).
 
 ## Read first — source of truth (in this order)
@@ -103,7 +114,7 @@ Each phase must be **verified working** before the next begins.
 | 3 | Checkpointing | `services/checkpoint.py` `AsyncPostgresSaver` (same `DATABASE_URL`); `setup()` once in lifespan; agent/model/mcp_client into `app.state` (no module globals) | LangGraph checkpoint tables appear in Neon | Done (pool-based factory, 4 tables in Neon, Alembic exclusion verified) |
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Done (all routes smoky green against live Neon: create/list/get/rename, happy+disconnect streams (is_error row persisted), approve 409+round-trip, 404s, soft-delete; ruff + 23 pytest green; disconnect flush is a strongly-referenced fire-and-forget task with logged failures) |
 | 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green; HTTP+Neon DB-persistence e2e green; prompts modularized into `src/app/prompts/`; follow-ups green: per-message `input_tokens`/`output_tokens` from streamed usage, `parent_id` chaining, final workflow as `Attachment` row + download route — 38 pytest) |
-| 6 | Streaming | Message/approve routes return SSE in the AI SDK v7 **Data Stream Protocol** (UI Message Stream, `x-vercel-ai-ui-message-stream: v1`); statuses as transient `data-status` parts; fresh text-part id per segment | `useChat` consumes it with zero config; wire-verified against the installed SDK reader; 51 pytest green | Done (decided DSP over the checklist's Text-Stream-first on evidence — see `_markdown/phase6/backend-phase6-plan.md`) |
+| 6 | Streaming | Message/approve routes return SSE in the AI SDK v7 **Data Stream Protocol** (UI Message Stream, `x-vercel-ai-ui-message-stream: v1`); statuses as transient `data-status` parts; fresh text-part id per segment | `useChat` consumes it with zero config; wire-verified against the installed SDK reader; 51 pytest green | Done (decided DSP over the checklist's Text-Stream-first on evidence — see `_markdown/phase6/backend-phase6-plan.md`; follow-ups: session-release + lock double-release + planner-fallback fixes → 54 green) |
 | 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
 | 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
 | 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for `npx n8n-mcp`); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main) | `docker build` passes locally | Not started |
@@ -133,6 +144,16 @@ Each phase must be **verified working** before the next begins.
   persisted to `Message.meta` at the end of each build.
 - **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,
   or payment calls yet. Treat every request as free during this phase.
+- **Chat lifecycle (Phase 6.6):** per-chat run lock in `services/chat_locks.py`
+  (`get_chat_lock`/`drop_chat_lock`). Rename strips + caps titles at **120 chars** and
+  bumps `updated_at`; a blank-only title is a `422`. Soft-delete flips `deleted_at`
+  and returns **409** if a stream holds the chat's lock (pending-approval parks hold no
+  lock → deletable). Account purge is `DELETE /api/v1/me/data`: one transaction,
+  `adelete_thread` per chat **before** the SQL, FK order attachments→messages→chats→
+  credit_transactions→payment_topups→credit_wallets, derivative of the user id, **never
+  touches `users`**; **409** if any chat is mid-stream. `KINDE_DELETE_MODE=local-only` —
+  the backend never talks to the Kinde Management API; the frontend owns auth-level
+  deletion.
 - **n8n-mcp:** self-hosted stdio (`npx n8n-mcp`) with env injection; core tools work with
   no n8n instance; cache `search_nodes`/`get_node` results in-memory. Use the real tool
   names (see Frontend context below) — there is no `get_node_essentials` tool.
@@ -183,11 +204,12 @@ START → plan_node ⇄ (loops with the user until the spec is complete & no ope
 ```
 POST   /api/v1/chats                          create chat
 GET    /api/v1/chats                          list user's chats
-GET/PATCH/DELETE /api/v1/chats/{chat_id}      read / rename / soft-delete
+GET/PATCH/DELETE /api/v1/chats/{chat_id}      read / rename (strip+120 cap) / soft-delete (409 if a stream holds the chat lock)
 GET    /api/v1/chats/{chat_id}/messages       history (resume)
 POST   /api/v1/chats/{chat_id}/messages       send message → streaming text response
 POST   /api/v1/chats/{chat_id}/approve        resume interrupted graph (approved + feedback)
 GET    /api/v1/chats/{chat_id}/messages/{message_id}/attachments/{attachment_id}/download   workflow file download (served from Message.meta)
+DELETE /api/v1/me/data                        purge current user's data (chats incl. soft-deleted + threads, messages, attachments, billing; never users); 409 if any chat is mid-stream
 GET    /api/v1/credits                        stub (balance)
 POST   /api/v1/webhooks/...                    stub (payments — Razorpay later)
 ```

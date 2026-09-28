@@ -1,10 +1,11 @@
 # BotChain AI — Backend API & Schema Reference (for the Next.js frontend)
 
 **Source of truth: the FastAPI app in `src/app/` (repo `botchain-ai`).** This doc exists so
-frontend agents can build the API calls without reading Python. It describes the **live
-contract as of Phase 5** (LangGraph flow + per-message tokens + parent chaining +
-workflow attachments). If a field's behavior surprises you, the Python in
-`src/app/api/v1/{chats,messages}.py` and `src/app/schemas/{chat,message,common}.py` wins.
+frontend agents can build the API calls without reading Python. It describes the
+**live contract as of Phase 6** (LangGraph flow + per-message tokens + parent chaining +
+workflow attachments + streaming + chat lifecycle + account purge). If a field's behavior
+surprises you, the Python in
+`src/app/api/v1/{chats,messages,me}.py` and `src/app/schemas/{chat,message,common}.py` wins.
 
 ---
 
@@ -94,7 +95,8 @@ Query: `page` (default 1), `page_size` (default 20, max 100).
 
 ### 4.4 Rename chat — `PATCH /api/v1/chats/{chat_id}`
 
-**Request body:** `{ "title": "New name" }` — `title` is **required** (1–255 chars).
+**Request body:** `{ "title": "New name" }` — `title` is **required**, 1–120 chars
+*(whitespace is stripped first; a blank-only title is a `422`)*.
 
 **Response `200` — `ChatOut`** with the new title. `404` on bad chat id.
 
@@ -102,6 +104,10 @@ Query: `page` (default 1), `page_size` (default 20, max 100).
 
 **Response `204 No Content`** (no body). `404` on bad chat id. Sets `deleted_at`; the
 chat is excluded from every list/get from then on.
+
+| Error | When |
+|---|---|
+| `409 Conflict` | A response is **actively streaming** for this chat (per-chat run lock held): body `"A response is still being generated for this chat — try again in a moment."` The frontend should show this as "wait, then retry". A chat *parked* at pending approval holds no lock and **is** deletable. |
 
 ### 4.6 List messages — `GET /api/v1/chats/{chat_id}/messages`
 
@@ -213,6 +219,27 @@ or the message has no stored `workflow_json`.
 ### 4.11 Webhooks — `/api/v1/webhooks/*` *(stub — no routes yet)*
 
 Mounted, empty. Payment webhooks (Razorpay) land here later; nothing to call now.
+
+### 4.12 Delete my data — `DELETE /api/v1/me/data`
+
+Account-level purge for the **current user**: deletes every chat (including
+soft-deleted ones) and their LangGraph checkpoint threads, messages, attachments,
+credit transactions, payments, and the wallet — **never the `users` row** (Kinde
+callbacks in the frontend own the user lifecycle).
+
+**Response `204 No Content`**. **Idempotent**: a second call with nothing left also
+returns `204`, so the frontend can send it unconditionally on account deletion.
+
+| Error | When |
+|---|---|
+| `401` | the usual auth failures (§2). |
+| `409 Conflict` | a response is actively streaming on any of the user's chats: body `"A request is still being processed for this account — try again in a moment."` |
+| `5xx` | a mid-purge failure — the partial transaction is rolled back (nothing is half-deleted). |
+
+Deletion order per chat is: LangGraph checkpoint thread → `attachments` →
+`messages` → `chats` → `credit_transactions` → `payment_topups` → `credit_wallets`,
+all in **one DB transaction**. Nothing here touches object storage (workflow
+attachments are DB-backed `Message.meta` JSON only, §4.10).
 
 ---
 

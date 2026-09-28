@@ -13,7 +13,7 @@ the three source-of-truth docs accordingly.
 
 ## 1. Goal
 
-> ✅ **Implemented + verified 2026-09-26** (51 pytest green, ruff clean;
+> ✅ **Implemented + verified 2026-09-26** (64 pytest green, ruff clean;
 > implementation record in `_markdown/phase6-implementation.md`).
 
 Both streaming endpoints — `POST /api/v1/chats/{chat_id}/messages` and

@@ -16,6 +16,7 @@ from app.deps import get_owned_chat, paginate
 from app.models import Attachment, Chat, Message, new_id
 from app.schemas.common import PageParams, Paginated
 from app.schemas.message import ApproveRequest, MessageCreate, MessageOut
+from app.services.chat_locks import get_chat_lock
 from app.streaming import UI_STREAM_HEADERS, _ui_stream
 
 router = APIRouter()
@@ -25,19 +26,6 @@ logger = logging.getLogger(__name__)
 APPROVAL_PENDING = "pending"
 
 _background_tasks: set[asyncio.Task] = set()
-
-_chat_locks: dict[str, asyncio.Lock] = {}
-
-
-def _chat_lock(chat_id: str) -> asyncio.Lock:
-    """Return the per-chat asyncio lock, creating it on first use.
-
-    Serialises sends and approval-resumes for a single chat so two requests
-    cannot interleave LangGraph runs against the same thread. No eviction:
-    this is a single-replica service, so the registry stays small for the
-    chat count the app is realistically going to see.
-    """
-    return _chat_locks.setdefault(chat_id, asyncio.Lock())
 
 
 def _serialize_response(message: Message) -> MessageOut:
@@ -411,7 +399,7 @@ async def send_message(
     chat: Chat = Depends(get_owned_chat),
     session: AsyncSession = Depends(get_session),
 ):
-    lock = _chat_lock(chat.id)
+    lock = get_chat_lock(chat.id)
     await lock.acquire()
     agent = request.app.state.agent
     config = await _agent_config(chat.id)
@@ -480,7 +468,7 @@ async def approve(
     the LangGraph thread with Command(resume=...) and streams the post-decision
     continuation (build + validation on approval; replan on rejection).
     """
-    lock = _chat_lock(chat.id)
+    lock = get_chat_lock(chat.id)
     await lock.acquire()
     try:
         recent = (

@@ -1,6 +1,6 @@
 import datetime as dt
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -9,6 +9,7 @@ from app.deps import get_current_user, get_owned_chat, paginate
 from app.models import Chat, User
 from app.schemas.chat import ChatCreate, ChatOut, ChatUpdate
 from app.schemas.common import PageParams, Paginated
+from app.services.chat_locks import get_chat_lock
 
 router = APIRouter()
 
@@ -73,6 +74,7 @@ async def rename_chat(
     session: AsyncSession = Depends(get_session),
 ) -> Chat:
     chat.title = payload.title
+    chat.updated_at = dt.datetime.now(dt.UTC)
     await session.commit()
     await session.refresh(chat)
     return chat
@@ -83,5 +85,10 @@ async def soft_delete_chat(
     chat: Chat = Depends(get_owned_chat),
     session: AsyncSession = Depends(get_session),
 ) -> None:
+    if get_chat_lock(chat.id).locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A response is still being generated for this chat — try again in a moment.",
+        )
     chat.deleted_at = dt.datetime.now(dt.UTC)
     await session.commit()
