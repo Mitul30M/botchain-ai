@@ -49,6 +49,7 @@ async def setup_checkpoint(max_size: int = 8) -> CheckpointService:
         max_size=max_size,
         kwargs=_CHECKPOINTER_KWARGS,
         open=False,
+        check=AsyncConnectionPool.check_connection,
     )
     await pool.open()
     checkpointer = AsyncPostgresSaver(pool)
