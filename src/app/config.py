@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     kinde_audience: str | None = None
 
     ollama_api_key: str = ""
+    mistral_api_key: str = ""
     n8n_api_url: str = ""
     n8n_api_key: str = ""
 

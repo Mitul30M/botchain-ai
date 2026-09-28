@@ -10,6 +10,7 @@ from app.models import Chat, User
 from app.schemas.chat import ChatCreate, ChatOut, ChatUpdate
 from app.schemas.common import PageParams, Paginated
 from app.services.chat_locks import get_chat_lock
+from app.services.llm import MODEL_NAME
 
 router = APIRouter()
 
@@ -23,8 +24,7 @@ async def create_chat(
     chat = Chat(user_id=current_user.id)
     if payload.title is not None:
         chat.title = payload.title
-    if payload.model is not None:
-        chat.model = payload.model
+    chat.model = payload.model or MODEL_NAME
     session.add(chat)
     await session.commit()
     await session.refresh(chat)

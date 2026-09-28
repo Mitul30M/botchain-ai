@@ -122,8 +122,11 @@ Each phase must be **verified working** before the next begins.
 
 ## Settled decisions (do not re-litigate without a reason)
 - **ORM:** SQLAlchemy 2.0 typed async models (NOT SQLModel).
-- **LLM:** Ollama (`ChatOllama`, cloud `nemotron-3-ultra:cloud`) for now, **behind
-  `services/llm.py`** so swapping to Claude later touches one file only.
+- **LLM:** Mistral (`ChatMistralAI`, `MISTRAL_API_KEY`) for now while models are being
+  evaluated — **behind `services/llm.py`** (the Ollama `ChatOllama` path is kept commented
+  in that file; swapping providers touches one file only). New chats store the **real model
+  name** (`services/llm.py` `MODEL_NAME`) in `Chat.model` at creation — not the DB's
+  `claude-sonnet-4-6` placeholder.
 - **Auth:** Kinde JWT via JWKS (`python-jose`); token arrives via the Next.js proxy route
   (frontend-phase wiring), CORS is a non-issue if that proxy pattern holds.
 - **`current_user`:** read-only `kinde_id` → User lookup. No get-or-create. A missing

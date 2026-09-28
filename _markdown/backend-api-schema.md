@@ -67,11 +67,11 @@ Create a chat for the current user.
 | Field | Type | Req | Notes |
 |---|---|---|---|
 | `title` | `string \| null` | no | max 255; `null`/omitted → server default `"New Chat"` |
-| `model` | `string \| null` | no | max 100; `null`/omitted → server default `"claude-sonnet-4-6"` (model actually used is fixed by the backend's `services/llm.py` for now) |
+| `model` | `string \| null` | no | max 100; `null`/omitted → the backend's **actually-configured model** (`models` value comes from `services/llm.py` `MODEL_NAME`, currently `"mistral-large-latest"`) — so `ChatOut.model` always reflects the real model used, not a placeholder |
 
 **Response `201` — `ChatOut`:**
 ```json
-{ "id": "…uuid…", "title": "My automation", "model": "claude-sonnet-4-6",
+{ "id": "…uuid…", "title": "My automation", "model": "mistral-large-latest",
   "pinned": false, "archived": false, "meta": {},
   "created_at": "…", "updated_at": "…" }
 ```

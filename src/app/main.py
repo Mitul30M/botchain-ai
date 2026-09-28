@@ -46,7 +46,12 @@ async def lifespan(app: FastAPI):
     model = create_model()
     app.state.model = model
 
-    agent = create_agent(model, mcp_tools, ckpt.checkpointer)
+    agent = create_agent(
+        model,
+        mcp_tools,
+        ckpt.checkpointer,
+        validate_connection=_n8n_mcp_connection(settings)["n8n-mcp"],
+    )
     app.state.agent = agent
 
     yield

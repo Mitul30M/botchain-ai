@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,9 +16,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import StructuredTool
+from langchain_mcp_adapters.sessions import create_session
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph, add_messages
 from langgraph.types import Command, interrupt
+from mcp import types as mcp_types
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 from app.prompts import (
@@ -38,6 +41,8 @@ _PLAN_DEGRADED_MESSAGE = (
     "I had trouble turning that into a clean requirements plan. "
     "Could you restate what you'd like to automate, in a sentence or two?"
 )
+
+logger = logging.getLogger(__name__)
 
 # Tools bound during build. Management tools (n8n_*) are deliberately excluded —
 # they need a live n8n instance and are not part of the curated workflow surface.
@@ -114,6 +119,23 @@ def _extract_text_payload(content: Any) -> str:
     return ""
 
 
+def _ensure_user_last(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Coerce a message history to end on a user (or tool) role.
+
+    Some providers (Mistral) reject a request whose last message is an
+    assistant or system turn — e.g. after an approval resumption the checked-in
+    history ends on the confirm node's assistant "Got it — building…". Drop
+    trailing assistant/system messages so the provider is happy; those turns
+    carry no needed context for the model. Never empty the history entirely.
+    """
+    msgs = list(messages)
+    while msgs and isinstance(msgs[-1], (AIMessage, SystemMessage)):
+        msgs.pop()
+    if not msgs:
+        msgs.append(HumanMessage(content="Continue."))
+    return msgs
+
+
 def _spec_summary(spec: Mapping[str, Any]) -> str:
     goal = spec.get("goal") or "an unspecified automation"
     trigger = spec.get("trigger_type") or "an unspecified trigger"
@@ -138,21 +160,24 @@ def _spec_summary(spec: Mapping[str, Any]) -> str:
 def _make_write_json_tool(sandbox_dir: str) -> StructuredTool:
     """Write a JSON dict into a per-build sandbox dir; returns a short confirmation."""
 
-    def write_json_file(file_path: str, content: dict | list) -> str:
+    def write_json_file(file_path: str, content: Any) -> str:
         safe_path = file_path.lstrip("/")
         target = os.path.realpath(os.path.join(sandbox_dir, safe_path))
         root = os.path.realpath(sandbox_dir)
         if root != target and root not in os.path.commonpath([root, target]):
             raise RuntimeError("write_json_file path escapes the sandbox directory.")
+        obj = _coerce_json_content(content)
+        if obj is None:
+            raise RuntimeError("write_json_file content must be a JSON object.")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as fh:
-            json.dump(content, fh, indent=2)
+            json.dump(obj, fh, indent=2)
         return f"Updated file {safe_path}"
 
     Schema = create_model(
         "WriteJsonFile",
         file_path=(str, Field(description="Destination path, e.g. 'workflow.json'.")),
-        content=(dict, Field(description="The workflow dict (dict or list).")),
+        content=(Any, Field(description="The workflow dict (dict, list, or JSON string).")),
     )
     return StructuredTool.from_function(
         name="write_json_file",
@@ -163,6 +188,123 @@ def _make_write_json_tool(sandbox_dir: str) -> StructuredTool:
         func=write_json_file,
         args_schema=Schema,
     )
+
+
+def _coerce_json_content(value: Any) -> Any | None:
+    """Return JSON-able content (dict/list) or a JSON string parsed to one; else None."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(value, (dict, list)):
+        return value
+    return None
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Parse a JSON object (dict) out of model text, leniently.
+
+    Tries the whole (fence-stripped) text first, then the outermost ``{...}``
+    span — models frequently wrap the workflow in prose or a fenced block.
+    """
+    cleaned = _strip_code_fences(text).strip()
+    if not cleaned:
+        return None
+    candidates = [cleaned]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_node_positions(node: dict) -> None:
+    """Convert n8n node position shapes to canonical [x, y] array (in place)."""
+    position = node.get("position")
+    if isinstance(position, Mapping):
+        x, y = position.get("x"), position.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            node["position"] = [x, y]
+
+
+def _normalize_workflow_json(workflow: dict) -> dict:
+    """Coerce common non-canonical model output into n8n's import schema.
+
+    Smaller models frequently emit ``nodes`` as an object keyed by id,
+    ``connections`` keyed by id with targets by id, ``main`` as a flat list
+    instead of array-of-arrays, and ``position`` as ``{"x","y"}`` objects.
+    This deterministically rewrites those shapes; already-canonical workflow
+    JSON (e.g. the user-facing shape the plan produces) passes through with
+    no changes. Returns a deep copy.
+    """
+    wf = json.loads(json.dumps(workflow))
+    id_to_name: dict[str, str] = {}
+
+    nodes = wf.get("nodes")
+    if isinstance(nodes, dict):
+        node_list: list[dict] = []
+        for key, node in nodes.items():
+            if not isinstance(node, dict):
+                continue
+            node = dict(node)
+            name = str(node.get("name") or key)
+            node["name"] = name
+            _normalize_node_positions(node)
+            id_to_name[str(key)] = name
+            if isinstance(node.get("id"), str):
+                id_to_name[node["id"]] = name
+            node_list.append(node)
+        wf["nodes"] = node_list
+    elif isinstance(nodes, list):
+        for node in nodes:
+            if isinstance(node, dict):
+                _normalize_node_positions(node)
+                if isinstance(node.get("id"), str) and isinstance(node.get("name"), str):
+                    id_to_name[node["id"]] = node["name"]
+
+    connections = wf.get("connections")
+    if isinstance(connections, dict):
+        new_connections: dict[str, Any] = {}
+        for source_key, conn in connections.items():
+            source_name = id_to_name.get(str(source_key), str(source_key))
+            if isinstance(conn, dict):
+                main = conn.get("main")
+                if isinstance(main, list):
+                    new_main: list[Any] = []
+                    for entry in main:
+                        if isinstance(entry, dict):
+                            entry = dict(entry)
+                            target = entry.get("node")
+                            if target is not None and str(target) in id_to_name:
+                                entry["node"] = id_to_name[str(target)]
+                            new_main.append([entry])
+                        elif isinstance(entry, list):
+                            rewired = []
+                            for sub in entry:
+                                if isinstance(sub, dict):
+                                    sub = dict(sub)
+                                    if sub.get("node") is not None and str(sub["node"]) in id_to_name:
+                                        sub["node"] = id_to_name[str(sub["node"])]
+                                rewired.append(sub)
+                            new_main.append(rewired)
+                        else:
+                            new_main.append(entry)
+                    new_connections[source_name] = {**conn, "main": new_main}
+                else:
+                    new_connections[source_name] = conn
+            else:
+                new_connections[source_name] = conn
+        wf["connections"] = new_connections
+
+    return wf
 
 
 class _NodeLookupCache:
@@ -217,6 +359,7 @@ async def build_workflow_with_validation(
     workflow_json: dict,
     validate_tool,
     model,
+    validate_connection: dict | None = None,
 ) -> dict:
     """Validate a workflow JSON against n8n-mcp's validator, self-repairing on failure.
 
@@ -226,7 +369,10 @@ async def build_workflow_with_validation(
     current = workflow_json
     last_result: dict | None = None
     for attempt in range(1, MAX_VALIDATION_RETRIES + 1):
-        raw = await validate_tool.ainvoke({"workflow": current})
+        # Coerce non-canonical model output (nodes-by-id, flat main, etc.) back
+        # to n8n's import schema before every check — including after repairs.
+        current = _normalize_workflow_json(current)
+        raw = await _invoke_validate_tool(validate_tool, current, validate_connection)
         result = _extract_validate_result(raw)
         last_result = result
         if result.get("valid"):
@@ -258,23 +404,105 @@ async def build_workflow_with_validation(
     }
 
 
+def _stringify_error_fields(errors: Any) -> list:
+    """Coerce non-string ``details``/``message`` fields in validator errors.
+
+    n8n-mcp sometimes returns ``errors[].details`` as a structured ``{"fix": ...}``
+    object even though its declared output schema says string; the MCP adapter's
+    strict schema check then raises and discards the whole result. Keeping those
+    fields as strings is what downstream consumers (repair prompt, persisted
+    meta, UI rendering) expect.
+    """
+    if not isinstance(errors, list):
+        return []
+    normalized: list[Any] = []
+    for err in errors:
+        if not isinstance(err, Mapping):
+            normalized.append(err)
+            continue
+        item = dict(err)
+        for field in ("details", "message"):
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                item[field] = json.dumps(value, ensure_ascii=False)
+        normalized.append(item)
+    return normalized
+
+
 def _extract_validate_result(raw: Any) -> dict:
     if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
+        result = raw
+    elif isinstance(raw, str):
         try:
-            return json.loads(_strip_code_fences(raw))
+            parsed = json.loads(_strip_code_fences(raw))
+            result = parsed if isinstance(parsed, dict) else {"valid": False, "errors": [raw]}
         except json.JSONDecodeError:
-            return {"valid": False, "errors": [raw]}
-    if isinstance(raw, list):
+            result = {"valid": False, "errors": [raw]}
+    elif isinstance(raw, list):
+        result = None
         for block in raw:
             if isinstance(block, Mapping) and block.get("type") == "text":
                 text = block.get("text", "")
                 try:
-                    return json.loads(_strip_code_fences(text))
+                    parsed = json.loads(_strip_code_fences(text))
                 except json.JSONDecodeError:
-                    return {"valid": False, "errors": [text]}
-    return {"valid": False, "errors": [f"Unexpected validation result: {raw!r}"]}
+                    result = {"valid": False, "errors": [text]}
+                    break
+                if isinstance(parsed, dict):
+                    result = parsed
+                    break
+        if result is None:
+            result = {"valid": False, "errors": [f"Unexpected validation result: {raw!r}"]}
+    else:
+        result = {"valid": False, "errors": [f"Unexpected validation result: {raw!r}"]}
+    if isinstance(result.get("errors"), list):
+        result["errors"] = _stringify_error_fields(result["errors"])
+    return result
+
+
+async def _raw_validate_call(connection: dict, workflow: dict) -> dict:
+    """Run n8n-mcp's validate_workflow over a raw session, skipping schema checks.
+
+    ``langchain_mcp_adapters`` raises ``RuntimeError`` when a tool's structured
+    content violates its declared schema — which n8n-mcp does for
+    ``errors[].details`` — and throws the whole result away. A raw
+    ``send_request`` returns the structured content untouched, so all validation
+    errors survive for the repair loop.
+    """
+    request = mcp_types.ClientRequest(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="validate_workflow", arguments={"workflow": workflow}
+            )
+        )
+    )
+    async with create_session(connection) as session:
+        await session.initialize()
+        result = await session.send_request(request, mcp_types.CallToolResult)
+    if isinstance(result.structuredContent, Mapping):
+        return dict(result.structuredContent)
+    return _extract_validate_result(result.content)
+
+
+async def _invoke_validate_tool(
+    validate_tool, workflow: dict, validate_connection: dict | None
+) -> Any:
+    """Run validate_workflow, preferring the non-strict raw call when a
+    connection is configured; otherwise degrade gracefully instead of crashing
+    if the adapter rejects the tool's output."""
+    if validate_connection is not None:
+        try:
+            return await _raw_validate_call(validate_connection, workflow)
+        except Exception as e:  # noqa: BLE001 - surface as a failed run, not a crash
+            logger.warning("raw validate_workflow call failed: %s", e)
+            return {"valid": False, "errors": [{"message": str(e), "details": str(e)}]}
+    try:
+        return await validate_tool.ainvoke({"workflow": workflow})
+    except RuntimeError as e:
+        if "structured content" not in str(e):
+            raise
+        logger.warning("validate_workflow returned schema-violating content: %s", e)
+        return {"valid": False, "errors": [{"message": str(e), "details": str(e)}]}
 
 
 # ---------------------------------------------------------------------------
@@ -337,13 +565,18 @@ def _make_plan_node(plan_model, model):
         writer = get_stream_writer()
         writer({"status": "Planning…"})
         spec = state.get("spec") or {}
-        messages: list[AnyMessage] = [SystemMessage(content=PLAN_SYSTEM_PROMPT)]
+        messages: list[AnyMessage] = [
+            SystemMessage(content=PLAN_SYSTEM_PROMPT),
+            # Spec context sits beside the system prompt (not trailing the
+            # history) — some providers reject a trailing system message.
+            SystemMessage(
+                content=(
+                    "CURRENT REQUIREMENTS SPEC (fill gaps; keep fields you have):\n"
+                    + json.dumps(spec, indent=2)
+                )
+            ),
+        ]
         messages.extend(state.get("messages", []))
-        spec_context = (
-            "CURRENT REQUIREMENTS SPEC (fill gaps; keep fields you have):\n"
-            + json.dumps(spec, indent=2)
-        )
-        messages.append(SystemMessage(content=spec_context))
 
         out = await _invoke_structured_with_retry(plan_model, model, messages)
         new_spec = {
@@ -414,6 +647,9 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
         if feedback := state.get("build_feedback"):
             loop_messages.append(HumanMessage(content=feedback))
         loop_messages.extend(state.get("messages", []))
+        # After an approval resumption the history ends on an assistant turn
+        # (e.g. "Got it — building…"); Mistral rejects a last-role assistant.
+        loop_messages = _ensure_user_last(loop_messages)
 
         captured_workflow: dict | None = None
         captured_name = "workflow.json"
@@ -421,13 +657,17 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
         for _ in range(MAX_TOOL_LOOP_TURNS):
             response = await bound.ainvoke(loop_messages)
             if not response.tool_calls:
+                # Model finished in prose without a write_json_file call — keep
+                # the reply so the fallback parser can harvest a JSON workflow
+                # embedded in the text.
+                loop_messages.append(response)
                 break
             loop_messages.append(response)
             for tc in response.tool_calls:
                 name, args = tc["name"], tc["args"]
                 if name == "write_json_file":
                     writer({"status": "Assembling the workflow file…"})
-                    content = args.get("content")
+                    content = _coerce_json_content(args.get("content"))
                     if isinstance(content, dict):
                         captured_workflow = content
                         captured_name = str(args.get("file_path") or captured_name)
@@ -444,18 +684,17 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
                     ToolMessage(content=str(result), tool_call_id=tc["id"])
                 )
 
-        # Fallback: model answered without calling write_json_file — try to parse JSON.
-        if captured_workflow is None and loop_messages:
-            last = loop_messages[-1]
-            if isinstance(last, AIMessage):
-                text = _extract_text_payload(last.content)
-                cleaned = _strip_code_fences(text)
-                try:
-                    parsed = json.loads(cleaned)
-                    if isinstance(parsed, dict):
-                        captured_workflow = parsed
-                except json.JSONDecodeError:
-                    pass
+        # Fallback: no write_json_file call — scan backwards for an assistant
+        # reply that embeds the workflow JSON in prose or a fenced block.
+        if captured_workflow is None:
+            for msg in reversed(loop_messages):
+                if isinstance(msg, AIMessage):
+                    workflow = _extract_json_object(
+                        _extract_text_payload(msg.content)
+                    )
+                    if workflow is not None:
+                        captured_workflow = workflow
+                        break
 
         if captured_workflow is None:
             return {
@@ -482,7 +721,7 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
     return build_node
 
 
-def _make_validate_node(model, tools_by_name: dict):
+def _make_validate_node(model, tools_by_name: dict, validate_connection: dict | None = None):
     validate_tool = tools_by_name.get("validate_workflow")
 
     async def validate_node(state: dict) -> dict:
@@ -490,6 +729,8 @@ def _make_validate_node(model, tools_by_name: dict):
         writer({"status": "Checking the workflow…"})
         workflow = state.get("workflow_json")
         name = state.get("workflow_name") or "workflow.json"
+        if isinstance(workflow, dict):
+            workflow = _normalize_workflow_json(workflow)
         if workflow is None:
             return {
                 "phase": "done",
@@ -506,7 +747,7 @@ def _make_validate_node(model, tools_by_name: dict):
             }
 
         result = await build_workflow_with_validation(
-            name, workflow, validate_tool, model
+            name, workflow, validate_tool, model, validate_connection=validate_connection
         )
         retries = state.get("retry_count", 0)
 
@@ -588,7 +829,7 @@ def _render_errors(errors: list[Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def create_agent(model, mcp_tools: list, checkpointer) -> object:
+def create_agent(model, mcp_tools: list, checkpointer, validate_connection: dict | None = None) -> object:
     """Compile the Plan → Confirm → Build → Validate StateGraph.
 
     The compiled graph is the object stored on ``app.state.agent``; routes call
@@ -604,7 +845,7 @@ def create_agent(model, mcp_tools: list, checkpointer) -> object:
     graph.add_node("plan", _make_plan_node(plan_model, model))
     graph.add_node("confirm", _make_confirm_node())
     graph.add_node("build", _make_build_node(model, tools_by_name, cache))
-    graph.add_node("validate", _make_validate_node(model, tools_by_name))
+    graph.add_node("validate", _make_validate_node(model, tools_by_name, validate_connection))
 
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", _plan_router, {"confirm": "confirm", END: END})

@@ -16,6 +16,10 @@ Rules:
 - When the assembled workflow JSON dict is ready, call `write_json_file` exactly once with
   `file_path` like "workflow.json" and `content` = the complete workflow dict (nodes,
   parameters, positions, connections).
+- Export n8n's canonical JSON shape: `nodes` is an ARRAY of node objects (each with
+  `name`, `type`, `typeVersion`, `parameters`, and `position` as a `[x, y]` array); 
+  `connections` is an OBJECT keyed by the SOURCE NODE'S NAME, and each target is
+  referenced by its node name inside a `"main": [[...]]` array-of-arrays.
 - Prefer the IF node over Switch for a single binary condition; use Switch for 3+ branches.
 - Keep parameter values simple and correct. Do not explain the JSON in your reply — output
   a short plain-language confirmation once the file is written.
