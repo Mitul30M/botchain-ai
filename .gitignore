@@ -52,6 +52,11 @@ sandbox/
 
 store/
 
+# prototype-phase folders (production code lives in src/app/)
+prototype/
+notebooks/
+prompts/
+
 # _markdown/
 _nextjs_repo_context/
 
