@@ -28,7 +28,7 @@ from app.prompts import (
     build_build_system_prompt,
     build_plan_system_prompt,
 )
-from app.services.llm import MistralCapacityError, ainvoke_with_capacity_retries
+from app.services.llm import ModelTransientError, ainvoke_with_capacity_retries
 
 PLAN_SYSTEM_PROMPT = build_plan_system_prompt()
 BUILD_SYSTEM_PROMPT = build_build_system_prompt()
@@ -36,6 +36,17 @@ BUILD_SYSTEM_PROMPT = build_build_system_prompt()
 MAX_VALIDATION_RETRIES = 3
 MAX_GRAPH_RETRIES = 3
 MAX_TOOL_LOOP_TURNS = 30
+
+# A model can return a bare/empty completion (no tool calls, no text) mid-build.
+# Retrying a couple of times recovers the workflow; past that it is treated as a
+# genuine failure so the loop still terminates.
+MAX_EMPTY_BUILD_TURNS = 3
+
+_EMPTY_TURN_NUDGE = (
+    "Your last message came back empty. Do not describe the workflow in prose — "
+    "call write_json_file now with the complete, valid n8n workflow JSON object. "
+    "Reply with the tool call only."
+)
 
 _PLAN_FALLBACK_RETRIES = 2
 _PLAN_DEGRADED_MESSAGE = (
@@ -189,6 +200,68 @@ def _make_write_json_tool(sandbox_dir: str) -> StructuredTool:
         func=write_json_file,
         args_schema=Schema,
     )
+
+
+async def _invoke_build_tool(tool, name: str, args: dict, diag: dict) -> str:
+    """Invoke a build tool, turning a failure into feedback the model can act on.
+
+    ``write_json_file`` raises on a malformed payload (not a JSON object, or a
+    path escaping the sandbox). Left unhandled that RuntimeError aborted the whole
+    build, so one bad tool call ended the stream with no chance for the model to
+    fix its own output. The error now goes back as the tool result instead, and is
+    recorded for diagnostics.
+    """
+    try:
+        return str(await tool.ainvoke(args))
+    except Exception as exc:  # noqa: BLE001 - any tool failure becomes model feedback
+        logger.warning("build tool %s failed: %s: %s", name, type(exc).__name__, exc)
+        diag.setdefault("tool_errors", []).append(f"{name}: {exc}")
+        return f"ERROR: {name} failed: {exc}. Fix the arguments and call the tool again."
+
+
+def _preview(value: Any, limit: int = 300) -> str:
+    """Return a short, log-safe repr of ``value`` for diagnostics."""
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        text = repr(value)
+    text = " ".join(text.split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _describe_build_failure(diag: dict) -> str:
+    """Explain, from the loop diagnostics, why no workflow was captured.
+
+    Distinguishes the four real failure modes so the log (and the user-facing
+    message) names the actual cause instead of a generic apology.
+    """
+    if diag["write_json_calls"] and diag["unparseable_write_previews"]:
+        return (
+            f"the model wrote a workflow file but its contents weren't valid JSON "
+            f"(arg types: {diag['write_content_kinds']}, first 300 chars: "
+            f"{diag['unparseable_write_previews'][0]!r})"
+        )
+    if diag["write_json_calls"]:
+        return (
+            "the model called write_json_file but it produced a JSON list rather "
+            "than a workflow object"
+        )
+    if diag["empty_responses"]:
+        return (
+            f"the model returned an empty reply {diag['empty_responses']} time(s) "
+            f"instead of writing the workflow (tool calls: {diag['tool_calls']})"
+        )
+    if diag["loop_exhausted"]:
+        return (
+            f"the model never called write_json_file in {diag['turns_used']} build "
+            f"turns (tool calls: {diag['tool_calls']})"
+        )
+    if diag["ended_in_prose"]:
+        return (
+            "the model replied in prose without calling write_json_file and "
+            f"without any embedded workflow JSON (last reply: {diag['last_text']!r})"
+        )
+    return "the build step ended without producing any tool calls or text"
 
 
 def _coerce_json_content(value: Any) -> Any | None:
@@ -520,6 +593,17 @@ def _build_validate_router(state: dict) -> str:
     return "build" if state.get("phase") == "build" else END
 
 
+def _build_to_validate_router(state: dict) -> str:
+    """Route build -> validate unless the build step already reached a terminal state.
+
+    ``build_node`` returns ``phase="done"`` when it could not capture a workflow at
+    all (no JSON written, or a transient model-capacity failure). Those carries the
+    specific diagnostic; routing them on to validate would replace it with the
+    generic "no workflow to validate" message.
+    """
+    return "validate" if state.get("phase") == "build" else END
+
+
 async def _invoke_structured_with_retry(
     plan_model, model, messages: list[AnyMessage]
 ) -> PlanOutput:
@@ -544,7 +628,7 @@ async def _invoke_structured_with_retry(
             if out is None or not getattr(out, "goal", None):
                 raise ValueError("plan model returned empty output")
             return out
-        except MistralCapacityError:
+        except ModelTransientError:
             break
         except Exception:  # noqa: BLE001 - fall back to plain JSON on any structured failure
             if attempt == 0:
@@ -552,7 +636,7 @@ async def _invoke_structured_with_retry(
     for _ in range(_PLAN_FALLBACK_RETRIES):
         try:
             response = await ainvoke_with_capacity_retries(model, messages)
-        except MistralCapacityError:
+        except ModelTransientError:
             break
         cleaned = _strip_code_fences(_extract_text_payload(response.content))
         if not cleaned:
@@ -673,26 +757,74 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
 
         captured_workflow: dict | None = None
         captured_name = "workflow.json"
+        # Diagnostics for the "no workflow captured" path, which used to return a
+        # generic apology with nothing in the logs — the single hardest build
+        # failure to diagnose. Collected on every pass so a failure can say what
+        # the model actually did instead of guessing.
+        diag: dict[str, Any] = {
+            "turns_used": 0,
+            "loop_exhausted": False,
+            "ended_in_prose": False,
+            "tool_calls": [],
+            "write_json_calls": 0,
+            "write_arg_keys": set(),
+            "write_content_kinds": [],
+            "unparseable_write_previews": [],
+            "tool_errors": [],
+            "empty_responses": 0,
+            "last_text": "",
+        }
 
         try:
-            for _ in range(MAX_TOOL_LOOP_TURNS):
+            for turn in range(MAX_TOOL_LOOP_TURNS):
+                diag["turns_used"] = turn + 1
                 response = await ainvoke_with_capacity_retries(bound, loop_messages)
+                diag["last_text"] = _preview(_extract_text_payload(response.content))
                 if not response.tool_calls:
+                    # A bare completion is not "finished in prose". Some models
+                    # (observed with gemma4:cloud) return an entirely empty turn
+                    # after a few tool calls; treating that as the end of the build
+                    # produced "no workflow" with no cause. Nudge instead.
+                    if not diag["last_text"] and diag["empty_responses"] < MAX_EMPTY_BUILD_TURNS:
+                        diag["empty_responses"] += 1
+                        logger.warning(
+                            "build turn %d returned an empty completion (no tool "
+                            "calls, no text) — nudging the model to write the "
+                            "workflow (attempt %d/%d)",
+                            turn + 1,
+                            diag["empty_responses"],
+                            MAX_EMPTY_BUILD_TURNS,
+                        )
+                        loop_messages.append(response)
+                        loop_messages.append(HumanMessage(content=_EMPTY_TURN_NUDGE))
+                        continue
                     # Model finished in prose without a write_json_file call — keep
                     # the reply so the fallback parser can harvest a workflow JSON
                     # embedded in the text.
+                    diag["ended_in_prose"] = True
                     loop_messages.append(response)
                     break
                 loop_messages.append(response)
                 for tc in response.tool_calls:
                     name, args = tc["name"], tc["args"]
+                    diag["tool_calls"].append(name)
                     if name == "write_json_file":
                         writer({"status": "Assembling the workflow file…"})
-                        content = _coerce_json_content(args.get("content"))
+                        diag["write_json_calls"] += 1
+                        diag["write_arg_keys"].update(args.keys())
+                        raw = args.get("content")
+                        diag["write_content_kinds"].append(type(raw).__name__)
+                        content = _coerce_json_content(raw)
                         if isinstance(content, dict):
                             captured_workflow = content
                             captured_name = str(args.get("file_path") or captured_name)
-                        result = await write_tool.ainvoke(args)
+                        else:
+                            # Keep a preview of what we could not parse — this is
+                            # the most common cause of an uncaptured workflow.
+                            diag["unparseable_write_previews"].append(
+                                _preview(raw)
+                            )
+                        result = await _invoke_build_tool(write_tool, name, args, diag)
                     elif name in tools_by_name:
                         writer({"status": "Looking that node up…"})
                         result = await _call_cached(
@@ -704,14 +836,19 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
                     loop_messages.append(
                         ToolMessage(content=str(result), tool_call_id=tc["id"])
                     )
-        except MistralCapacityError:
-            logger.warning("Mistral out of capacity during build; degrading gracefully")
-            writer({"status": "Mistral is at capacity right now — standing down."})
+            else:
+                diag["loop_exhausted"] = True
+        except ModelTransientError as e:
+            logger.warning("Model backend transient failure during build: %s", e)
+            writer({"status": "The AI backend is unavailable right now — standing down."})
             return {
                 "phase": "done",
                 "validation_status": "build_failed",
                 "validation_errors": [
-                    "Mistral's backend was temporarily out of capacity. Please retry shortly."
+                    (
+                        "The AI backend was temporarily unavailable (capacity or network "
+                        "timeout). Your answers are saved — please retry to build the workflow."
+                    )
                 ],
                 "messages": [
                     AIMessage(
@@ -724,6 +861,15 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
                     )
                 ],
             }
+        except Exception:
+            logger.exception(
+                "build loop raised an unexpected error after %d turns "
+                "(tool calls so far: %s, write_json_file calls: %d)",
+                diag["turns_used"],
+                diag["tool_calls"],
+                diag["write_json_calls"],
+            )
+            raise
 
         # Fallback: no write_json_file call — scan backwards for an assistant
         # reply that embeds the workflow JSON in prose or a fenced block.
@@ -738,16 +884,36 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
                         break
 
         if captured_workflow is None:
+            reason = _describe_build_failure(diag)
+            logger.warning(
+                "build step produced no workflow — %s | turns_used=%d/%d, "
+                "ended_in_prose=%s, write_json_file calls=%d, tool_calls=%s, "
+                "write_arg_keys=%s, write_content_kinds=%s, tool_errors=%s, "
+                "empty_responses=%d, unparseable_write_previews=%s, last_text=%s",
+                reason,
+                diag["turns_used"],
+                MAX_TOOL_LOOP_TURNS,
+                diag["ended_in_prose"],
+                diag["write_json_calls"],
+                diag["tool_calls"],
+                sorted(diag["write_arg_keys"]),
+                diag["write_content_kinds"],
+                diag["tool_errors"],
+                diag["empty_responses"],
+                diag["unparseable_write_previews"],
+                diag["last_text"],
+            )
             return {
                 "phase": "done",
                 "validation_status": "build_failed",
-                "validation_errors": ["No workflow JSON was produced by the build step."],
+                "validation_errors": [reason],
                 "messages": [
                     AIMessage(
                         content=(
-                            "I couldn't assemble a workflow from the confirmed plan. "
-                            "Something went wrong during the build step — please try again, "
-                            "and let me know if you saw an error."
+                            "I couldn't assemble a workflow from the confirmed plan: "
+                            f"{reason} Nothing was lost — the plan and your approval "
+                            "are still saved, so just send the message again and I'll "
+                            "retry the build."
                         )
                     )
                 ],
@@ -890,7 +1056,9 @@ def create_agent(model, mcp_tools: list, checkpointer, validate_connection: dict
 
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", _plan_router, {"confirm": "confirm", END: END})
-    graph.add_edge("build", "validate")
+    graph.add_conditional_edges(
+        "build", _build_to_validate_router, {"validate": "validate", END: END}
+    )
     graph.add_conditional_edges(
         "validate", _build_validate_router, {"build": "build", END: END}
     )

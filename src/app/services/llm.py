@@ -6,6 +6,11 @@ import httpx
 # from langchain_ollama import ChatOllama
 from langchain_mistralai import ChatMistralAI
 
+try:  # provider-agnostic connection failures; name moved between langchain-core versions
+    from langchain_core.exceptions import APIConnectionError as _LCConnectionError
+except ImportError:  # pragma: no cover - older/newer langchain-core
+    _LCConnectionError = None
+
 from app.config import get_settings
 
 # --- Ollama (commented out 2026-09-28 while evaluating Mistral; swap back by
@@ -26,22 +31,51 @@ _MISTRAL_MODEL = "ministral-14b-latest"
 MODEL_NAME = _MISTRAL_MODEL
 
 
-class MistralCapacityError(RuntimeError):
+class ModelTransientError(RuntimeError):
+    """Transient provider failure that survived every retry.
+
+    Callers catch this to degrade gracefully (re-prompt, best-effort output)
+    instead of letting a network blip abort a multi-minute build.
+    """
+
+
+class MistralCapacityError(ModelTransientError):
     """Raised when Mistral's backend stays out of capacity across retries."""
 
 
+class ModelTransportError(ModelTransientError):
+    """Raised when the provider kept timing out / dropping the connection."""
+
+
+# Transport-level failures where no response ever arrived, so retrying is safe.
+# NOTE httpx.ReadTimeout is a TransportError but *not* a RequestError, which is
+# why langchain-mistralai's own retry decorator lets it escape and it used to
+# kill the whole build loop.
+_TRANSIENT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.TimeoutException,
+    httpx.TransportError,
+)
+if _LCConnectionError is not None:  # pragma: no branch
+    _TRANSIENT_TRANSPORT_ERRORS += (_LCConnectionError,)
+
+
 async def ainvoke_with_capacity_retries(callable, messages, retries: int | None = None):
-    """Invoke ``callable.ainvoke(messages)``, retrying transient capacity 429s.
+    """Invoke ``callable.ainvoke(messages)``, retrying transient failures.
 
-    Mistral returns ``backend_out_of_capacity`` (code 3505) HTTP 429 responses
-    when the serving backend is momentarily saturated. langchain-mistralai's
-    built-in retry decorator only retries ``httpx.RequestError``/``StreamError``
-    and deliberately lets ``HTTPStatusError`` (which 429 raises) through, so
-    without this wrapper a capacity blip aborts the whole build/plan stream.
+    Two classes of transient failure are retried with exponential backoff + jitter:
 
-    Only capacity/overload 429s are retried (with exponential backoff + jitter);
-    any other status (401/403/404/5xx…) re-raises immediately. When retries run
-    out, raises ``MistralCapacityError`` so callers can degrade gracefully.
+    1. Capacity 429s. Mistral returns ``backend_out_of_capacity`` (code 3505)
+       HTTP 429 when the serving backend is momentarily saturated.
+       langchain-mistralai's built-in retry decorator only retries
+       ``httpx.RequestError``/``StreamError`` and deliberately lets
+       ``HTTPStatusError`` (which 429 raises) through, so without this wrapper a
+       capacity blip aborts the whole build/plan stream.
+    2. Transport failures — read timeouts, dropped connections, connect errors.
+       These carry no response, so retrying is always safe.
+
+    Any other status (401/403/404/5xx…) re-raises immediately. When retries run
+    out, raises a :class:`ModelTransientError` subclass so callers can degrade
+    gracefully instead of propagating a raw httpx traceback.
     """
     if retries is None:
         retries = get_settings().mistral_capacity_retries
@@ -54,6 +88,14 @@ async def ainvoke_with_capacity_retries(callable, messages, retries: int | None 
             if attempt == retries:
                 raise MistralCapacityError(
                     "Mistral backend still out of capacity after retries."
+                ) from e
+            backoff = min(1.5 * (2**attempt), 10) + random.uniform(0, 0.5)
+            await asyncio.sleep(backoff)
+        except _TRANSIENT_TRANSPORT_ERRORS as e:
+            if attempt == retries:
+                raise ModelTransportError(
+                    f"Model provider kept failing after {retries + 1} attempts: "
+                    f"{type(e).__name__}: {e}"
                 ) from e
             backoff = min(1.5 * (2**attempt), 10) + random.uniform(0, 0.5)
             await asyncio.sleep(backoff)

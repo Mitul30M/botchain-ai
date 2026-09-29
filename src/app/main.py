@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,6 +10,17 @@ from app.config import get_settings
 from app.services.agent import create_agent
 from app.services.checkpoint import setup_checkpoint
 from app.services.llm import create_model
+
+# Uvicorn only configures its own loggers, so app loggers (app.services.agent,
+# app.api...) fell through to Python's lastResort handler: WARNING+ on stderr and
+# nothing at INFO. Build diagnostics were therefore invisible in the terminal.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _n8n_mcp_connection(settings) -> dict:
