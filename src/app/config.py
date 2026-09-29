@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     ollama_api_key: str = ""
     mistral_api_key: str = ""
+    mistral_capacity_retries: int = 3
     n8n_api_url: str = ""
     n8n_api_key: str = ""
 

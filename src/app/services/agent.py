@@ -28,6 +28,7 @@ from app.prompts import (
     build_build_system_prompt,
     build_plan_system_prompt,
 )
+from app.services.llm import MistralCapacityError, ainvoke_with_capacity_retries
 
 PLAN_SYSTEM_PROMPT = build_plan_system_prompt()
 BUILD_SYSTEM_PROMPT = build_build_system_prompt()
@@ -344,11 +345,12 @@ async def _repair_workflow(model, workflow_json: dict, errors: list) -> dict:
         f"CURRENT WORKFLOW:\n{json.dumps(workflow_json, indent=2)}\n\n"
         f"VALIDATION ERRORS:\n{json.dumps(errors, indent=2)}"
     )
-    response = await model.ainvoke(
+    response = await ainvoke_with_capacity_retries(
+        model,
         [
             SystemMessage(content=REPAIR_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
-        ]
+        ],
     )
     cleaned = _strip_code_fences(_extract_text_payload(response.content))
     return json.loads(cleaned)
@@ -538,15 +540,20 @@ async def _invoke_structured_with_retry(
     )
     for attempt in range(2):
         try:
-            out = await plan_model.ainvoke(messages)
+            out = await ainvoke_with_capacity_retries(plan_model, messages)
             if out is None or not getattr(out, "goal", None):
                 raise ValueError("plan model returned empty output")
             return out
+        except MistralCapacityError:
+            break
         except Exception:  # noqa: BLE001 - fall back to plain JSON on any structured failure
             if attempt == 0:
                 messages = [SystemMessage(content=strict_prompt), *messages]
     for _ in range(_PLAN_FALLBACK_RETRIES):
-        response = await model.ainvoke(messages)
+        try:
+            response = await ainvoke_with_capacity_retries(model, messages)
+        except MistralCapacityError:
+            break
         cleaned = _strip_code_fences(_extract_text_payload(response.content))
         if not cleaned:
             continue
@@ -667,35 +674,56 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
         captured_workflow: dict | None = None
         captured_name = "workflow.json"
 
-        for _ in range(MAX_TOOL_LOOP_TURNS):
-            response = await bound.ainvoke(loop_messages)
-            if not response.tool_calls:
-                # Model finished in prose without a write_json_file call — keep
-                # the reply so the fallback parser can harvest a workflow JSON
-                # embedded in the text.
+        try:
+            for _ in range(MAX_TOOL_LOOP_TURNS):
+                response = await ainvoke_with_capacity_retries(bound, loop_messages)
+                if not response.tool_calls:
+                    # Model finished in prose without a write_json_file call — keep
+                    # the reply so the fallback parser can harvest a workflow JSON
+                    # embedded in the text.
+                    loop_messages.append(response)
+                    break
                 loop_messages.append(response)
-                break
-            loop_messages.append(response)
-            for tc in response.tool_calls:
-                name, args = tc["name"], tc["args"]
-                if name == "write_json_file":
-                    writer({"status": "Assembling the workflow file…"})
-                    content = _coerce_json_content(args.get("content"))
-                    if isinstance(content, dict):
-                        captured_workflow = content
-                        captured_name = str(args.get("file_path") or captured_name)
-                    result = await write_tool.ainvoke(args)
-                elif name in tools_by_name:
-                    writer({"status": "Looking that node up…"})
-                    result = await _call_cached(
-                        tools_by_name[name], name, args, cache
+                for tc in response.tool_calls:
+                    name, args = tc["name"], tc["args"]
+                    if name == "write_json_file":
+                        writer({"status": "Assembling the workflow file…"})
+                        content = _coerce_json_content(args.get("content"))
+                        if isinstance(content, dict):
+                            captured_workflow = content
+                            captured_name = str(args.get("file_path") or captured_name)
+                        result = await write_tool.ainvoke(args)
+                    elif name in tools_by_name:
+                        writer({"status": "Looking that node up…"})
+                        result = await _call_cached(
+                            tools_by_name[name], name, args, cache
+                        )
+                    else:
+                        writer({"status": "Working…"})
+                        result = f"Unknown tool: {name}"
+                    loop_messages.append(
+                        ToolMessage(content=str(result), tool_call_id=tc["id"])
                     )
-                else:
-                    writer({"status": "Working…"})
-                    result = f"Unknown tool: {name}"
-                loop_messages.append(
-                    ToolMessage(content=str(result), tool_call_id=tc["id"])
-                )
+        except MistralCapacityError:
+            logger.warning("Mistral out of capacity during build; degrading gracefully")
+            writer({"status": "Mistral is at capacity right now — standing down."})
+            return {
+                "phase": "done",
+                "validation_status": "build_failed",
+                "validation_errors": [
+                    "Mistral's backend was temporarily out of capacity. Please retry shortly."
+                ],
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "The AI backend is temporarily over capacity, so I couldn't "
+                            "finish assembling your workflow. Nothing was lost — please "
+                            "send your message again in a moment and I'll pick up where "
+                            "we left off."
+                        )
+                    )
+                ],
+            }
 
         # Fallback: no write_json_file call — scan backwards for an assistant
         # reply that embeds the workflow JSON in prose or a fenced block.
