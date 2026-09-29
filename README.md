@@ -15,7 +15,7 @@ its own proxy routes; backend↔frontend wiring is in progress on the frontend s
 ## Current status
 
 Production build in progress, working the 10-phase checklist in `_markdown/` phase by
-phase. **Phases 1–6 verified done; Phase 7 (sandbox/files) is next.**
+phase. **Phases 1–7 verified done; Phase 8 (tests) is next.**
 
 | Phase | Milestone | Status |
 |---|---|---|
@@ -26,7 +26,7 @@ phase. **Phases 1–6 verified done; Phase 7 (sandbox/files) is next.**
 | 4 | Core routes — chats CRUD, messages, approve | Done |
 | 5 | LangGraph Plan→Confirm→Build→Validate flow, approval interrupt, validated end-to-end | Done |
 | 6 | Streaming — AI SDK v7 **Data Stream Protocol** (UI Message Stream) | Done |
-| 7 | Sandbox/files — per-turn ephemeral scratch, workflow persisted to `Message.meta` | Next |
+| 7 | Sandbox/files — per-turn ephemeral scratch, workflow persisted to `Message.meta` | Done |
 | 8 | Tests — coverage hardening | Not started |
 | 9 | Containerize + CI (Dockerfile, GitHub Actions) | Not started |
 | 10 | First deploy (Railway) | Deferred — owner runs it |

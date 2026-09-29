@@ -70,7 +70,11 @@ per-chat lock registry moved to `services/chat_locks.py` (`get_chat_lock` /
 LangGraph checkpoint threads (via `adelete_thread`, before the rows), messages,
 attachments, and billing rows in one transaction — never touching `users`.
 **64 pytest green, ruff clean.** See `_markdown/phase6.6/backend-lifecycle-plan.md`.
-next: Phase 7 (sandbox/files).
+Phase 7 (sandbox/files) done — per-build `TemporaryDirectory` sandbox (torn down
+after the build loop), workflow persisted to `Message.meta` and served via the
+download route with no disk dependency; **95 pytest green, ruff clean.** See
+`_markdown/phase7/backend-phase7-plan.md`.
+next: Phase 8 (tests).
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the

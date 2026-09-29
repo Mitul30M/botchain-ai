@@ -639,7 +639,20 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
 
     async def build_node(state: dict) -> dict:
         writer = get_stream_writer()
-        sandbox_dir = tempfile.mkdtemp(prefix="botchain-build-")
+        # The sandbox is per-build scratch only (Railway's disk is ephemeral);
+        # the finished workflow is returned in state and later persisted to
+        # Message.meta, so the dir is torn down as soon as the loop ends.
+        with tempfile.TemporaryDirectory(prefix="botchain-build-") as sandbox_dir:
+            return await _run_build_loop(
+                model,
+                state,
+                writer,
+                sandbox_dir,
+                build_tools,
+                cache,
+            )
+
+    async def _run_build_loop(model, state: dict, writer, sandbox_dir: str, build_tools: list, cache) -> dict:
         write_tool = _make_write_json_tool(sandbox_dir)
         bound = model.bind_tools([*build_tools, write_tool])
 
@@ -658,7 +671,7 @@ def _make_build_node(model, tools_by_name: dict, cache: _NodeLookupCache):
             response = await bound.ainvoke(loop_messages)
             if not response.tool_calls:
                 # Model finished in prose without a write_json_file call — keep
-                # the reply so the fallback parser can harvest a JSON workflow
+                # the reply so the fallback parser can harvest a workflow JSON
                 # embedded in the text.
                 loop_messages.append(response)
                 break

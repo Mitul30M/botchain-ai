@@ -31,6 +31,7 @@ def create_model() -> ChatMistralAI:
         model=_MISTRAL_MODEL,
         api_key=settings.mistral_api_key or None,
         temperature=0.2,
+        timeout=600,
     )
     # Ollama cloud version (kept for reference while Mistral is active):
     # return ChatOllama(

@@ -250,10 +250,14 @@ botchain-ai/
       this straight through without buffering — `_markdown/phase6/nextjs-app-phase6-plan.md`.
 
 ## Phase 7 — Sandbox / workflow draft handling
-- [ ] Don't rely on `SANDBOX_DIR` surviving between requests or replicas —
+- [x] Don't rely on `SANDBOX_DIR` surviving between requests or replicas —
       see Q8. For now: single Railway replica, sandbox as scratch space
       only, final workflow JSON persisted to Postgres (e.g. in
       `Message.meta` or a small dedicated table) at the end of each turn
+      — done: per-build `TemporaryDirectory` sandbox (torn down after the
+      build loop, `services/agent.py`), workflow persists to `Message.meta`
+      and is served by the download route without any disk. See
+      `_markdown/phase7/backend-phase7-plan.md`; 95 pytest green.
 
 ## Phase 8 — Tests
 - [ ] `conftest.py`: a Neon branch (or local Postgres in CI) as the test DB
