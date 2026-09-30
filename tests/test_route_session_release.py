@@ -51,8 +51,9 @@ class _RouteAgent:
 
 
 class _RouteChat:
-    def __init__(self, chat_id):
+    def __init__(self, chat_id, model="ministral-14b-latest"):
         self.id = chat_id
+        self.model = model
 
 
 class _RouteScalars:

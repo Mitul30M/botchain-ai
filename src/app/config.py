@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated
 
@@ -28,6 +29,11 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_endpoint: str = "https://api.smith.langchain.com"
     langsmith_project: str = "botchain-ai"
+
+    # Fallback USD-per-1M-token rates for models missing from MODEL_PRICING, so a
+    # newly released model still records a real cost instead of pricing at zero.
+    pricing_unknown_input_per_million: Decimal = Decimal("0.20")
+    pricing_unknown_output_per_million: Decimal = Decimal("0.20")
 
     @field_validator("cors_origins", mode="before")
     @classmethod

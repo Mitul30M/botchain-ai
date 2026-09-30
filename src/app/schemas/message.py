@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +31,7 @@ class MessageOut(BaseModel):
     is_error: bool
     input_tokens: int | None
     output_tokens: int | None
+    credits_cost: Decimal | None
     meta: dict
     created_at: datetime
     attachments: list[AttachmentOut] = Field(default_factory=list)

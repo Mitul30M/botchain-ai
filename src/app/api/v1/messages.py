@@ -17,6 +17,7 @@ from app.models import Attachment, Chat, Message, new_id
 from app.schemas.common import PageParams, Paginated
 from app.schemas.message import ApproveRequest, MessageCreate, MessageOut
 from app.services.chat_locks import get_chat_lock
+from app.services.pricing import credits_cost
 from app.streaming import UI_STREAM_HEADERS, _ui_stream
 
 router = APIRouter()
@@ -103,6 +104,7 @@ async def _flush_assistant_row(
     parent_id: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    model: str | None = None,
 ) -> None:
     """Persist one assistant Message row (open its own session; commit).
 
@@ -115,6 +117,11 @@ async def _flush_assistant_row(
     backfilled with the run's token totals, the assistant row references its
     parent, and a finalized workflow (phase "done") is stored as an Attachment
     row pointing at a download route that serves it from Message.meta.
+
+    ``model`` is the chat's model name; it prices the run's tokens into
+    ``credits_cost`` (a dollar value) on the assistant row. The triggering user
+    row is deliberately left without a cost: its tokens are the same run's, and
+    costing both would double-count.
     """
     async with get_session_factory()() as session:
         if context_summary is not None:
@@ -140,6 +147,7 @@ async def _flush_assistant_row(
             parent_id=parent_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            credits_cost=credits_cost(input_tokens, output_tokens, model),
         )
         session.add(assistant)
         await session.flush()
@@ -224,6 +232,7 @@ async def _assistant_stream(
     content: str,
     lock: asyncio.Lock,
     user_message_id: str | None = None,
+    model: str | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Run the agent on a new user message and stream the reply.
 
@@ -290,6 +299,7 @@ async def _assistant_stream(
                 "parent_id": user_message_id,
                 "input_tokens": in_tokens or None,
                 "output_tokens": out_tokens or None,
+                "model": model,
             }
             if request_task is not None and request_task.cancelling():
                 kwargs["is_error"] = True
@@ -307,6 +317,7 @@ async def _approve_stream(
     feedback: str | None,
     lock: asyncio.Lock,
     parent_id: str | None = None,
+    model: str | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Resume an interrupted run with the approval decision and stream the result."""
     agent = request.app.state.agent
@@ -354,6 +365,7 @@ async def _approve_stream(
                 "parent_id": parent_id,
                 "input_tokens": in_tokens or None,
                 "output_tokens": out_tokens or None,
+                "model": model,
             }
             if request_task is not None and request_task.cancelling():
                 kwargs["is_error"] = True
@@ -447,7 +459,12 @@ async def send_message(
     return StreamingResponse(
         _ui_stream(
             _assistant_stream(
-                request, chat_id, payload.content, lock, user_message_id=user_message_id
+                request,
+                chat_id,
+                payload.content,
+                lock,
+                user_message_id=user_message_id,
+                model=chat.model,
             )
         ),
         media_type="text/event-stream",
@@ -511,7 +528,13 @@ async def approve(
     return StreamingResponse(
         _ui_stream(
             _approve_stream(
-                request, chat_id, payload.approved, payload.feedback, lock, parent_id=pending_id
+                request,
+                chat_id,
+                payload.approved,
+                payload.feedback,
+                lock,
+                parent_id=pending_id,
+                model=chat.model,
             )
         ),
         media_type="text/event-stream",
