@@ -154,6 +154,15 @@ Each phase must be **verified working** before the next begins.
   persisted to `Message.meta` at the end of each build.
 - **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,
   or payment calls yet. Treat every request as free during this phase.
+- **Token pricing → `messages.credits_cost` (record-only):** `services/pricing.py` prices a
+  run's tokens into `credits_cost` on the **assistant** row only, using `Chat.model`. The
+  column is **a DOLLAR value** (0.20 = $0.20) resolved from
+  `PRICING_{INPUT,OUTPUT}_PER_MILLION_<SLUG>` env → `MODEL_PRICING` table → settings
+  fallback for unknown models. `NULL` when there is no usage (never a misleading 0). The
+  triggering **user** row is deliberately left `NULL` — its tokens are the same run's, and
+  costing both would double-count. **No wallet deduction and no `credit_transactions` row
+  yet** (deliberate). Pydantic serializes the `Decimal` as a JSON **string**
+  (`"0.000227"`), so the frontend types it `string | null` — don't cast to float.
 - **Chat lifecycle (Phase 6.6):** per-chat run lock in `services/chat_locks.py`
   (`get_chat_lock`/`drop_chat_lock`). Rename strips + caps titles at **120 chars** and
   bumps `updated_at`; a blank-only title is a `422`. Soft-delete flips `deleted_at`
