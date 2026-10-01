@@ -1,0 +1,79 @@
+# Docker build context — allowlist ("fail closed")
+#
+# Rules here are the single most security-sensitive file in the repo: this file
+# decides what leaves the developer's machine. `.gitignore` is NOT consulted by
+# Docker, so without it every `docker build` would ship the whole working tree.
+#
+# Measured on the repo as of 2026-10-01, a denyless build context is ~264 MB and
+# includes `.env` (MISTRAL_API_KEY, the Neon URL, the Kinde issuer), `.venv`
+# (258 MB) and `.git`. That is the failure this file exists to prevent.
+#
+# Strategy: exclude everything, then re-include only the handful of paths the
+# image build actually reads. A newly added secret is therefore excluded by
+# default, instead of being exposed because someone forgot to extend a denylist.
+#
+# ---------------------------------------------------------------------------
+# WARNING — Docker's .dockerignore has NO inline-comment syntax.
+# A `#` only starts a comment as the FIRST character of a line. Trailing text
+# after a pattern becomes part of the pattern itself, so
+#
+#     !pyproject.toml    # the deps file
+#
+# parses as the pattern "!pyproject.toml    # the deps file", matches nothing,
+# and the re-include silently fails (context ships empty). Every comment in this
+# file is therefore on its own line. Do not "tidy" them into trailing form.
+# ---------------------------------------------------------------------------
+
+# Exclude every top-level entry by default.
+*
+
+# --- build inputs -----------------------------------------------------------
+# deps, build backend, and [tool.hatch.build] packages
+!pyproject.toml
+# required by `uv sync --frozen`
+!uv.lock
+# pyproject sets readme = "README.md"; hatchling reads it during the wheel build
+!README.md
+# the package itself. src/app/prompts/ is a module inside src/ and IS needed.
+!src/
+
+# --- keep build outputs clean ----------------------------------------------
+**/__pycache__/
+**/*.py[cod]
+**/*.so
+**/.DS_Store
+**/.pytest_cache/
+**/.ruff_cache/
+
+# --- belt-and-braces ---------------------------------------------------------
+# Already excluded by the allowlist above; restated so an accidental future
+# re-include can't quietly pull one of these back into the context.
+#
+# These are deliberately root-anchored (leading "/"). Do NOT "simplify" them to
+# `**/prompts` or `**/tests`: those would also match src/app/prompts/ and tests/
+# and silently break the build.
+/.env
+/.env.*
+/.venv
+/.git
+# LangGraph sqlite scratch
+/store
+/sandbox
+/prototype
+/notebooks
+# prototype-only placeholder; the real prompts are src/app/prompts
+/prompts
+# runtime image must not migrate Prisma's schema
+/alembic
+/alembic.ini
+/tests
+/_markdown
+/_nextjs_repo_context
+/Dockerfile
+
+# `.python-version` (3.14.6) is intentionally NOT shipped. The base image floats
+# on the 3.14 line, so pinning an exact patch here would make uv try to download
+# its own interpreter mid-build. Excluding it lets uv resolve against the image's
+# system python via `requires-python = ">=3.14.6"`; WS9.2 pairs this with
+# UV_PYTHON_DOWNLOADS=never so that resolution can never reach the network.
+/.python-version
