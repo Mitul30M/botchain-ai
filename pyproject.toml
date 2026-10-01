@@ -51,3 +51,6 @@ extend-ignore = ["B008"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "db: requires a real PostgreSQL database via DATABASE_URL (excluded from CI)",
+]

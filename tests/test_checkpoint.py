@@ -14,6 +14,12 @@ _LANGGRAPH_TABLES = {
     "checkpoint_writes",
 }
 
+# The only tests in the suite that touch a real database. Excluded from CI with
+# `-m "not db"` so CI stays secret-free: DATABASE_URL here resolves to the
+# production Neon branch, and putting it in CI secrets would make every PR write
+# to production. Select with `-m db` once a dedicated `tests` branch exists.
+pytestmark = pytest.mark.db
+
 
 @pytest.fixture(scope="module")
 async def ckpt_service():

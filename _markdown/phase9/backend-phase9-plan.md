@@ -184,18 +184,32 @@ product/policy decision for the repo owner, not a containerisation detail. Flagg
 than decided. Note the same allowlist means *any* future MCP env var must be added there
 too, or it will silently not arrive.
 
-### WS9.4 — CI on pull requests
-`.github/workflows/ci.yml`, three jobs on PRs: lint → test → image build.
-- `uv sync --frozen --group dev`; `uv run ruff check src tests`; `uv run pytest`.
-- **Test DB: `uv run pytest -m "not db"`.** Rationale: `tests/test_checkpoint.py` is the only
-  real-DB test and it currently reads `DATABASE_URL`, which resolves to **production**
-  (`ep-rapid-rain-…`, `br-aged-sunset-b39a2u2u`). Putting that URL in CI secrets would make
-  **every PR write to production** — strictly worse than skipping it. Selecting it out is the
-  only hermetic option until the Neon `tests` branch exists.
-- Therefore WS9.4 **requires** declaring a `db` marker in `pyproject.toml` and marking
-  `test_checkpoint.py` — a two-line change that is the smallest useful slice of Phase 8.
-- `docker build` job on PR so image breakage is caught before merge.
-- **Gate:** CI green on a throwaway PR with no secrets configured.
+### WS9.4 — CI on pull requests — ✅ **DONE** *(not yet run on GitHub — see gate)*
+`.github/workflows/ci.yml`, three independent jobs (parallel, not sequential, for faster
+PR feedback) triggered on `pull_request` **and** pushes to `main`, so the branch WS9.5
+deploys from is always verified. `concurrency` cancels superseded runs.
+
+| Job | Does | Notes |
+|---|---|---|
+| `lint` | `ruff check src tests` | — |
+| `test` | `pytest -m "not db" -v` | **secret-free** — see below |
+| `docker` | `docker/build-push-action` build | `platforms: linux/amd64`, gha layer cache |
+
+- **Action versions verified, not guessed.** `astral-sh/setup-uv` is at **v10**,
+  `docker/build-push-action` **v7**, `docker/setup-buildx-action` **v4**,
+  `actions/checkout` **v7** (queried the GitHub API; v5/v6 for setup-uv would have
+  been stale by several majors).
+- **The amd64 pin is deliberate.** Local builds only exercise arm64, so CI is the only
+  place the Railway target architecture gets built.
+- **Test DB: `pytest -m "not db"`.** `tests/test_checkpoint.py` is the only suite touching a
+  real database and it reads `DATABASE_URL`, which resolves to **production**. Putting that
+  in CI secrets would make **every PR write to production** — strictly worse than skipping.
+  Declared a `db` marker in `pyproject.toml` and applied it to that file (the smallest
+  useful slice of Phase 8). Verified the split is exactly 3 / 132 with **zero**
+  unknown-marker warnings.
+- **Gate: PARTIALLY MET — cannot self-verify.** `actionlint` passes clean (exit 0) and both
+  commands were run locally, but "CI green on a real PR" needs a push to GitHub, which is
+  the user's action. Everything up to that push is verified.
 
 ### WS9.5 — guarded deploy on `main`
 Config only; the first real deploy stays in Phase 10.

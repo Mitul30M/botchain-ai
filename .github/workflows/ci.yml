@@ -1,0 +1,68 @@
+name: CI
+
+# Runs on every PR, and on pushes to main so the branch a deploy ships from is
+# always verified. WS9.5's deploy job will gate on these three.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref instead of queueing them.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.11.25"
+  # Pinned to the builder stage in the Dockerfile; see
+  # _markdown/phase9/backend-phase9-plan.md.
+  UV_FROZEN: "1"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check src tests
+
+  test:
+    name: Test (pytest, no database)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      # `-m "not db"` is deliberate and load-bearing. tests/test_checkpoint.py is
+      # the only suite that touches a real database and it reads DATABASE_URL, which
+      # resolves to the PRODUCTION Neon branch. Wiring that URL into CI secrets
+      # would make every PR write to production, so CI runs no database at all and
+      # stays secret-free. The dedicated `tests` Neon branch is deferred (Phase 8);
+      # when it lands, switch this to a second job that runs `-m db` against it.
+      - name: Run test suite
+        run: uv run pytest -m "not db" -v
+
+  docker:
+    name: Image (docker build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          tags: botchain-ai:ci
+          # ubuntu runners are amd64, so this also proves the Railway target arch
+          # builds — locally we only exercise arm64.
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
