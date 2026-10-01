@@ -22,13 +22,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
+
 
 def _n8n_mcp_connection(settings) -> dict:
     """Return the stdio connection config for the n8n-mcp server."""
     return {
         "n8n-mcp": {
             "transport": "stdio",
-            "command": "npx",
+            "command": settings.n8n_mcp_command,
             "args": ["n8n-mcp"],
             "env": {
                 "MCP_MODE": "stdio",
@@ -53,7 +55,21 @@ async def lifespan(app: FastAPI):
 
     mcp_client = MultiServerMCPClient(_n8n_mcp_connection(settings))
     app.state.mcp_client = mcp_client
-    mcp_tools = await mcp_client.get_tools()
+    try:
+        mcp_tools = await mcp_client.get_tools()
+    except Exception:
+        # With the default `npx` command a cold boot reaches the npm registry, and a
+        # registry hiccup here would otherwise take the whole app down. Strict mode
+        # (the default) keeps that loud: the deploy fails instead of shipping an app
+        # that reports healthy but can no longer build workflows. Operators who
+        # would rather keep chat and history alive can set N8N_MCP_STRICT_BOOT=false.
+        if settings.n8n_mcp_strict_boot:
+            raise
+        logger.exception(
+            "n8n-mcp tool listing failed; starting with NO n8n tools — chat, planning "
+            "and history keep working, but workflow builds cannot."
+        )
+        mcp_tools = []
 
     model = create_model()
     app.state.model = model

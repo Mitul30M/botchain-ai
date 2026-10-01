@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     mistral_capacity_retries: int = 3
     n8n_api_url: str = ""
     n8n_api_key: str = ""
+    # How to launch the n8n-mcp stdio server. Local dev keeps the default `npx`,
+    # which resolves the package on demand. The production image overrides this to
+    # `n8n-mcp`, which it has pre-installed, so a cold boot never reaches the npm
+    # registry (see _markdown/phase9/backend-phase9-plan.md, R2).
+    n8n_mcp_command: str = "npx"
+    # Strict (default): a failed n8n-mcp tool listing aborts startup, so a broken
+    # MCP server is a failed deploy rather than an app that boots healthy but can
+    # no longer build workflows. Set false to boot anyway with an empty tool list
+    # (chat and history keep working; builds do not).
+    n8n_mcp_strict_boot: bool = True
 
     cors_origins: Annotated[list[str], NoDecode] = []
 

@@ -145,6 +145,45 @@ needs its own decision — it is **not** required for a working deploy.
 - **Gate:** `docker run` boots, `GET /health` → 200 **with no npm cache present**, and the
   agent graph is built with a real tool list.
 
+### WS9.3 — runtime contract — ✅ **DONE**
+- **PORT binding + `--reload`:** `CMD` runs `exec uvicorn app.main:app --host 0.0.0.0
+  --port ${PORT:-8000}`. `exec` makes uvicorn PID 1 so SIGTERM is delivered directly
+  instead of being swallowed by a shell; `--reload` is deliberately absent (dev-only,
+  and it would fork a watcher in the container).
+- **R2(a) `npx` → pre-installed binary:** `main.py` no longer hardcodes `"npx"`. It reads
+  the new `Settings.n8n_mcp_command` (**default `npx`**, so local dev is unchanged) and
+  the image sets `N8N_MCP_COMMAND=n8n-mcp`. Same pattern as the `services/llm.py`
+  "swap one file" rule. **Not a single hardcoded string** — both the `get_tools()` call
+  and the `validate_connection=` argument go through `_n8n_mcp_connection()`, so they
+  cannot drift apart (pinned by a test).
+- **Lifespan pre-flight — decided to stay STRICT by default.** A failed tool listing
+  aborts startup, so a broken n8n-mcp is a *failed deploy* rather than an app that
+  reports healthy but can no longer build workflows. Opt-in degradation exists via
+  `N8N_MCP_STRICT_BOOT=false`, which boots with an empty tool list and logs loudly.
+  Rationale: R2(a) already removes the registry fetch, so the failure being defended
+  against is far less likely — silently degrading would only trade a visible outage for
+  an invisible one.
+- **Gate: MET.** Image rebuilt and actually booted:
+  - container reached **`healthy`**; `GET /health` → `200 OK`; `Application startup complete`
+  - `setup_checkpoint()` completed against the real DB, proving DB wiring end-to-end
+  - `N8N_MCP_COMMAND=n8n-mcp` confirmed baked into the image
+  - `n8n-mcp` spawned and shut down cleanly (`STDIN_CLOSE`) → **no npm registry fetch**
+  - local dev unaffected: `n8n_mcp_command == "npx"`, `strict_boot is True`
+  - **11 new tests** in `tests/test_mcp_command.py` (135 total, ruff clean)
+
+#### ⚠️ Found while booting: the n8n-mcp child env is a hardcoded allowlist
+Booting the image printed n8n-mcp's **telemetry banner**, i.e. the third-party package
+phones home on every cold start. Setting container-level `DISABLE_TELEMETRY=true` did
+**nothing** — not a wrong variable name, but because `_n8n_mcp_connection()` passes an
+explicit `env` dict to the stdio child, so the child sees only those 5 keys and inherits
+nothing from the parent process.
+
+**Fix is one line** — add `"DISABLE_TELEMETRY": "true"` to that dict in `main.py`.
+**NOT applied**, because whether to opt out of a dependency's anonymous usage stats is a
+product/policy decision for the repo owner, not a containerisation detail. Flagged rather
+than decided. Note the same allowlist means *any* future MCP env var must be added there
+too, or it will silently not arrive.
+
 ### WS9.4 — CI on pull requests
 `.github/workflows/ci.yml`, three jobs on PRs: lint → test → image build.
 - `uv sync --frozen --group dev`; `uv run ruff check src tests`; `uv run pytest`.

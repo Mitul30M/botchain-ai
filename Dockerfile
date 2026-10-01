@@ -95,7 +95,8 @@ FROM python:${PYTHON_VERSION}-slim AS runtime
 # PYTHONUNBUFFERED: streaming SSE must not sit in a block buffer.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/build/.venv/bin:/opt/node/bin:${PATH}"
+    PATH="/build/.venv/bin:/opt/node/bin:${PATH}" \
+    N8N_MCP_COMMAND=n8n-mcp
 
 RUN groupadd --system botchain \
  && useradd --system --gid botchain --home-dir /app --no-create-home botchain
