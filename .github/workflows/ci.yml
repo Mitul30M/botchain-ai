@@ -100,15 +100,31 @@ jobs:
       # concern, pin a release binary from the railwayapp/cli releases instead.
       - name: Install Railway CLI
         run: bash <(curl -fsSL https://railway.com/install.sh) -y
+      # The installer only appends to ~/.bash_profile and says so itself ("New
+      # terminals will have railway available automatically"). Actions `run:`
+      # steps are non-login, non-interactive bash and never source that, so the
+      # binary lands in ~/.railway/bin but stays unresolvable -> the next step
+      # dies with exit 127, "railway: command not found". $GITHUB_PATH is the
+      # supported way to affect *subsequent* steps; exporting in the same step
+      # would not persist.
+      - name: Expose railway on PATH
+        run: echo "$HOME/.railway/bin" >> "$GITHUB_PATH"
       - name: Deploy
         # `--ci` exits when the Railway build completes, so a failed remote build
         # fails this job instead of reporting a green deploy. `--project` requires
         # `--environment`. `--service` picks the backend service explicitly.
-        run: >-
-          railway up --ci
-          --project "$RAILWAY_PROJECT_ID"
-          --environment production
-          --service "$RAILWAY_SERVICE"
+        # Fail loudly on an empty token: `railway up` would otherwise fail with a
+        # generic auth error that reads like a bad token rather than a missing one.
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::error::RAILWAY_TOKEN resolved empty -- set it on the 'production' environment, not the repo"
+            exit 1
+          fi
+          railway --version
+          railway up --ci \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --service "$RAILWAY_SERVICE"
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
