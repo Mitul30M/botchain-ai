@@ -1,3 +1,4 @@
+import logging
 import time
 
 import httpx
@@ -5,6 +6,8 @@ from fastapi import HTTPException, status
 from jose import jwt
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _JWKS_URL_SUFFIX = "/.well-known/jwks.json"
 _JWKS_TTL_SECONDS = 600.0
@@ -69,11 +72,19 @@ async def verify_token(token: str) -> dict:
     """
     try:
         header = jwt.get_unverified_header(token)
-    except jwt.JWTError:
+    except jwt.JWTError as exc:
+        logger.warning("kinde: unparseable JWT header: %s", exc)
         raise _unauthorized() from None
 
-    key = next((k for k in await _get_jwks() if k.get("kid") == header.get("kid")), None)
+    keys = await _get_jwks()
+    key = next((k for k in keys if k.get("kid") == header.get("kid")), None)
     if key is None:
+        logger.warning(
+            "kinde: no JWKS key for kid=%r; %s served %d key(s)",
+            header.get("kid"),
+            _jwks_url(),
+            len(keys),
+        )
         raise _unauthorized()
 
     settings = get_settings()
@@ -92,5 +103,21 @@ async def verify_token(token: str) -> dict:
             options=options,
             **kwargs,
         )
-    except jwt.JWTError:
+    except jwt.JWTError as exc:
+        # Log the comparison inputs, never the token: an issuer/audience
+        # mismatch is otherwise indistinguishable from a bad signature.
+        try:
+            claim_iss = jwt.get_unverified_claims(token).get("iss")
+        except jwt.JWTError:
+            claim_iss = None
+        logger.warning(
+            "kinde: JWT rejected: %s | alg=%r kid=%r "
+            "issuer_configured=%r issuer_claim=%r audience_configured=%r",
+            exc,
+            header.get("alg"),
+            header.get("kid"),
+            settings.kinde_issuer_url,
+            claim_iss,
+            settings.kinde_audience or None,
+        )
         raise _unauthorized() from None
