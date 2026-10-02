@@ -53,9 +53,17 @@ sandbox/
 store/
 
 # prototype-phase folders (production code lives in src/app/)
+# These are anchored with a leading `/` on purpose. An unanchored `prompts/`
+# matches a directory named `prompts` at ANY depth, so it also swallowed
+# src/app/prompts/ -- which is production code. The files stayed git-tracked
+# (gitignore never affects tracked files) so `git ls-files` looked healthy,
+# but hatchling honours .gitignore when building the wheel, so app/prompts
+# was silently omitted from the package. Local tests and the docker build
+# both passed because neither imports the installed wheel; production
+# crashed with ModuleNotFoundError on first boot.
 prototype/
 notebooks/
-prompts/
+/prompts
 
 # _markdown/
 _nextjs_repo_context/
