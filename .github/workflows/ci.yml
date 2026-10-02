@@ -1,11 +1,12 @@
 name: CI
 
 # Runs on every PR, and on pushes to main so the branch a deploy ships from is
-# always verified. WS9.5's deploy job will gate on these three.
+# always verified. The `deploy` job below gates on these three.
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref instead of queueing them.
 concurrency:
@@ -14,9 +15,6 @@ concurrency:
 
 env:
   UV_VERSION: "0.11.25"
-  # Pinned to the builder stage in the Dockerfile; see
-  # _markdown/phase9/backend-phase9-plan.md.
-  UV_FROZEN: "1"
 
 jobs:
   lint:
@@ -66,3 +64,44 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # WS9.5. Kept in this file rather than a separate deploy.yml on purpose: `needs`
+  # can only reference jobs in the SAME workflow, so a separate file could not
+  # actually gate on CI being green — the real guard this phase asks for.
+  deploy:
+    name: Deploy (Railway)
+    needs: [lint, test, docker]
+    # Inert until Phase 10: flip the RAILWAY_DEPLOY_ENABLED repository variable to
+    # "true". Both conditions keep it off PRs and off main until then. A skipped
+    # job does not fail the run, so this costs nothing while disabled.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.RAILWAY_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # GitHub Environment. Add required reviewers in repo settings so a production
+    # deploy needs a human click, and scope RAILWAY_TOKEN here so it is never
+    # exposed to pull-request runs.
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+      # Railway's CLI is installed on the runner rather than run via
+      # `container: ghcr.io/railwayapp/cli:latest`, because that image is
+      # Alpine-based (no bash, so `run:` steps fail) and `railway up` needs the
+      # source tree present in the workspace to upload.
+      # Trade-off: this executes a remote install script. If that becomes a
+      # concern, pin a release binary from the railwayapp/cli releases instead.
+      - name: Install Railway CLI
+        run: bash <(curl -fsSL https://railway.com/install.sh) -y
+      - name: Deploy
+        # `--ci` exits when the Railway build completes, so a failed remote build
+        # fails this job instead of reporting a green deploy. `--project` requires
+        # `--environment`. `--service` picks the backend service explicitly.
+        run: >-
+          railway up --ci
+          --project "$RAILWAY_PROJECT_ID"
+          --environment production
+          --service "$RAILWAY_SERVICE"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+          RAILWAY_SERVICE: ${{ vars.RAILWAY_SERVICE }}

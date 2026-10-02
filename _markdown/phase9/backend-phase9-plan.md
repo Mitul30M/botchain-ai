@@ -211,12 +211,56 @@ deploys from is always verified. `concurrency` cancels superseded runs.
   commands were run locally, but "CI green on a real PR" needs a push to GitHub, which is
   the user's action. Everything up to that push is verified.
 
-### WS9.5 — guarded deploy on `main`
+### WS9.5 — guarded deploy on `main` — ✅ **DONE** *(inert until Phase 10)*
 Config only; the first real deploy stays in Phase 10.
-- Trigger on `main`; require CI green + tag protection; environment-gated secrets.
-- Prefer deploy **after** merge (post-merge `main`) over PR-triggered previews, to match
-  Phase 10's "user runs it" scope.
-- **Gate:** workflow file is valid; deploy job stays disabled/dry until Phase 10.
+
+**Deploy job lives in `ci.yml`, not a separate `deploy.yml`.** This deviates from the
+original sketch on purpose: `needs` can only reference jobs in the *same* workflow, so a
+separate file could not have gated on CI being green — which is the entire point of a
+"guarded" deploy. One file, one gate, and the job is skipped on PRs so it costs nothing.
+
+- **Mechanism: CI-driven `railway up`**, chosen over Railway's GitHub integration because
+  that integration deploys on *any* push to the linked branch, red CI included. Here
+  `needs: [lint, test, docker]` means a red lint, test, or image build blocks the deploy.
+- **Inert by default.** `if: github.ref == 'refs/heads/main' && vars.RAILWAY_DEPLOY_ENABLED == 'true'`.
+  Phase 10 flips one repository variable. Chosen over a commented-out block precisely
+  because a live-but-skipped job still gets actionlint-validated; commented YAML does not.
+- **`environment: production`** — put required reviewers on it in repo settings for the
+  human-approval gate, and scope `RAILWAY_TOKEN` there so it never reaches PR runs.
+- **Corrected before writing it:** `railwayapp/railway-action` **does not exist** (404).
+  Railway's documented path is the CLI, so the job installs it via
+  `bash <(curl -fsSL https://railway.com/install.sh) -y` and runs
+  `railway up --ci --project … --environment production --service …`.
+  `--ci` exits when the *Railway* build completes, so a failed remote build fails the job
+  rather than reporting a green deploy. `--project` requires `--environment`.
+- **CLI on the runner, not `container: ghcr.io/railwayapp/cli:latest`** — that image is
+  Alpine-based (no `bash`, so `run:` steps fail) and `railway up` needs the checked-out
+  source tree in the workspace to upload. Trade-off accepted: a remote install script runs
+  in CI. If that ever matters, pin a `railwayapp/cli` release binary instead.
+- **`railway.json`** pins `builder: DOCKERFILE`, so Railway cannot silently fall back to
+  Railpack/Nixpacks and fail to detect the build plan. Validated against Railway's live
+  `railway.schema.json`, where `DOCKERFILE` is a documented `const`.
+- **Gate: MET.** `actionlint` exits 0 on the full workflow including the deploy job.
+
+**Four landmines recorded for Phase 10** (found while reading the code, not yet fixed):
+1. **`CORS_ORIGINS` unset ⇒ no CORS middleware at all.** `main.py` only adds it
+   `if settings.cors_origins`, so an unset value silently breaks the browser with a green
+   `/health`. Must be set on Railway.
+2. **Do not accept Railway's "import variables from `.env`" suggestion.** The committed
+   `.env.example` holds placeholders (`user:password@host`, blank `MISTRAL_API_KEY`);
+   importing them deploys an app that boots and then fails.
+3. **`/health` is shallow liveness** — it never touches the DB or MCP. A green Railway
+   healthcheck proves nothing; verify against a real DB-backed route after deploying.
+4. **`railway up` never creates a public domain** — run `railway domain` separately.
+
+Boot contract confirmed from `config.py` / `main.py`: `DATABASE_URL` and `MISTRAL_API_KEY`
+are hard requirements (empty ⇒ engine/Mistral raises during startup); `KINDE_ISSUER_URL`
+silently degrades to 401 on every authenticated route; `N8N_API_URL`/`N8N_API_KEY` fall back
+to `localhost:5678` (core MCP tools work without them). Neon `production` was re-verified
+as `ready` (it reads `archived` in older notes) on `ap-southeast-1`, and the backend
+`DATABASE_URL` is correctly the direct, unpooled host. The image ships no
+`alembic.ini`/`versions/` and the baseline `3169311c48d2` is already stamped, so **no
+migration step is needed at deploy time**.
 
 ### WS9.6 — housekeeping
 - Delete the stray root `main.py` shim (tracked; unused).
