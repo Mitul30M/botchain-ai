@@ -10,12 +10,15 @@ decision in live n8n documentation via the n8n-mcp server (1,600+ nodes) rather 
 model memory, and validating the result programmatically before delivery.
 
 The Next.js frontend (`botchain-ai-next-app`, separate repo) consumes this API through
-its own proxy routes; backend↔frontend wiring is in progress on the frontend side.
+its own proxy routes.
+
+**Live in production:** <https://botchain-ai-production.up.railway.app> — `/health` returns
+`200`, and `GET /api/v1/chats` with a real Kinde token returns `200` against production
+Neon. Deployed by a CI-gated `railway up`; see [Deployment](#deployment).
 
 ## Current status
 
-Production build in progress, working the 10-phase checklist in `_markdown/` phase by
-phase. **Phases 1–7 verified done; Phase 8 (tests) is next.**
+**Phases 0–7, 9 and 10 are done. Phase 8 is deferred by choice** — see the table note below.
 
 | Phase | Milestone | Status |
 |---|---|---|
@@ -26,10 +29,11 @@ phase. **Phases 1–7 verified done; Phase 8 (tests) is next.**
 | 4 | Core routes — chats CRUD, messages, approve | Done |
 | 5 | LangGraph Plan→Confirm→Build→Validate flow, approval interrupt, validated end-to-end | Done |
 | 6 | Streaming — AI SDK v7 **Data Stream Protocol** (UI Message Stream) | Done |
+| 6.6 | Chat lifecycle + account purge (`DELETE /me/data`) | Done |
 | 7 | Sandbox/files — per-turn ephemeral scratch, workflow persisted to `Message.meta` | Done |
-| 8 | Tests — coverage hardening | Not started |
-| 9 | Containerize + CI (Dockerfile, GitHub Actions) | Not started |
-| 10 | First deploy (Railway) | Deferred — owner runs it |
+| 8 | Tests — dedicated `tests` Neon branch | **Deferred by choice.** The suite is green (135 tests), but the branch does not exist yet, so the 3 real-DB checkpoint tests resolve `DATABASE_URL` to **production** and are marked `db` / excluded from CI. Resumes when the branch lands |
+| 9 | Containerize + CI (Dockerfile, GitHub Actions) | Done |
+| 10 | First deploy (Railway) | Done |
 
 The build checklist, settled architecture decisions, and phase-level implementation
 records are the source of truth — see [Source-of-truth docs](#source-of-truth-docs).
@@ -40,24 +44,29 @@ records are the source of truth — see [Source-of-truth docs](#source-of-truth-
 
 - **Python 3.14.6** (pinned in `.python-version`) and [`uv`](https://docs.astral.sh/uv/).
 - A **`.env`** file. Copy `.env.example`, then fill in real values — at minimum
-  `DATABASE_URL`, `KINDE_ISSUER_URL`, `OLLAMA_API_KEY`. `.env` is gitignored;
+  `DATABASE_URL`, `KINDE_ISSUER_URL`, `MISTRAL_API_KEY`. `.env` is gitignored;
   **never commit it.**
 
 ```dotenv
 # Required
 DATABASE_URL=postgresql://user:password@host.neon.tech/neondb?sslmode=require   # direct/unpooled
 KINDE_ISSUER_URL=https://your-app.kinde.com
-OLLAMA_API_KEY=
+MISTRAL_API_KEY=
 
 # Optional / when needed
-KINDE_AUDIENCE=
-N8N_API_URL=        # only for n8n-mcp's 16 management tools
+KINDE_AUDIENCE=       # leave empty; audience checks are skipped when unset
+OLLAMA_API_KEY=       # only for the commented-out ChatOllama path in services/llm.py
+N8N_API_URL=          # only for n8n-mcp's 16 management tools
 N8N_API_KEY=
 CORS_ORIGINS=http://localhost:3000
 ```
 
 > The backend must use the **direct (unpooled)** Neon URL — never the pooled `DATABASE_URL`
 > the frontend uses.
+
+> The model is Mistral (`ministral-14b-latest`) behind `src/app/services/llm.py`; the
+> Ollama path is kept commented out in that one file, so swapping providers touches one
+> file. `Chat.model` stores the real model name on each chat.
 
 ### Install
 
@@ -77,15 +86,20 @@ uv run uvicorn app.main:app --reload
 
 ### Run tests
 
-The suite hits a live Postgres database (the checkpointer test creates and drops the
-LangGraph tables), so `.env` must be present and `DATABASE_URL` pointed at the
-**`tests` Neon branch**, never production data.
-
 ```sh
-uv run pytest                    # whole suite (64 tests)
+uv run pytest                    # whole suite (135 tests)
+uv run pytest -m "not db"        # 132 — skips the 3 real-DB checkpoint tests
 uv run pytest -k streaming       # a single area
 uv run pytest tests/test_security.py
 ```
+
+> **The `tests` Neon branch does not exist yet.** `tests/test_checkpoint.py` is the only
+> suite that touches a real database, and it reads `DATABASE_URL` — so locally it resolves
+> to the **production** branch unless you point it elsewhere. Those 3 tests carry
+> `pytestmark = pytest.mark.db` and CI runs `pytest -m "not db"`, which keeps CI entirely
+> secret-free (wiring the production URL into CI secrets would make every PR write to
+> production). When the `tests` branch lands, add a second CI job running `-m db` against
+> it rather than widening the existing one.
 
 ### Lint
 
@@ -136,11 +150,12 @@ START → plan_node ⇄ (loops with the user until the spec is complete & no ope
 |---|---|---|
 | POST | `/chats` | create chat |
 | GET | `/chats` | list user's chats |
-| GET/PATCH/DELETE | `/chats/{chat_id}` | read / rename / soft-delete |
+| GET/PATCH/DELETE | `/chats/{chat_id}` | read / rename (strip, 120-char cap) / soft-delete (409 while a stream holds the chat) |
 | GET | `/chats/{chat_id}/messages` | history (resume) |
 | POST | `/chats/{chat_id}/messages` | send message → streaming reply |
 | POST | `/chats/{chat_id}/approve` | resume interrupted graph (approved + feedback) |
-| GET | `/chats/{chat_id}/messages/{message_id}/attachments/{attachment_id}/download` | workflow file download |
+| GET | `/chats/{chat_id}/messages/{message_id}/attachments/{attachment_id}/download` | workflow file download (served from `Message.meta`) |
+| DELETE | `/me/data` | purge the current user's data — chats (incl. soft-deleted) + checkpoint threads, messages, attachments, billing. Never touches `users`; 409 if any chat is mid-stream |
 | GET | `/credits` | stub (balance) |
 | POST | `/webhooks/*` | stub (payments — Razorpay later) |
 
@@ -152,28 +167,66 @@ Stream): `start` → transient `data-status` progress heartbeats → `text-start
 `[DONE]`, with header `x-vercel-ai-ui-message-stream: v1`. `useChat()` in the frontend
 consumes it with zero config. Full wire spec: `_markdown/backend-api-schema.md` §5.
 
+## Deployment
+
+Deployed to **Railway** at <https://botchain-ai-production.up.railway.app>, one replica in
+Southeast Asia (matching Neon `ap-southeast-1`).
+
+- **CI-driven.** `.github/workflows/ci.yml` runs `lint`, `test`, `package` and `docker`, and
+  the `deploy` job (`railway up`) gates on all four. It is inert on pull requests and only
+  runs on `main` when the `RAILWAY_DEPLOY_ENABLED` repository variable is `"true"`.
+- **Railway GitHub autodeploy is disabled on purpose.** A GitHub-linked service auto-deploys
+  on every push and would ship regardless of CI, bypassing the gate. The only path to
+  production is the `needs`-gated job.
+- `RAILWAY_TOKEN` is scoped to the GitHub **`production` environment**, not the repo, so it
+  is unreadable from pull requests.
+- Runtime variables are set by hand in Railway as **sealed** values — never by importing
+  `.env`. Required: `DATABASE_URL` (Neon direct/unpooled), `MISTRAL_API_KEY`,
+  `KINDE_ISSUER_URL`. `N8N_API_*` may stay empty (the 7 core MCP tools work without an n8n
+  instance).
+
+Two things to know before touching the deploy config:
+
+- **The domain's target port must be `8080`.** Railway injects `PORT=8080` and the `CMD`
+  honors it (`--port ${PORT:-8000}`), so uvicorn binds 8080. Pointing the domain at 8000
+  produces an edge `502` from a perfectly healthy container.
+- **`CORS_ORIGINS` is still unset**, which means *no* CORS middleware is added at all. The
+  API is healthy, but a browser cannot call it. Set it to the frontend origin, then redeploy.
+
+Full first-deploy procedure, both production incidents (and why each passed every gate), and
+the rollback/stop-the-line steps: **`_markdown/phase10-deploy-runbook.md`**.
+
 ## Repo map
 
 ```
 ├── src/app/                  production backend (FastAPI)
-│   ├── main.py               app factory, lifespan, routers
+│   ├── main.py               app factory, lifespan, routers, n8n-mcp launch
 │   ├── config.py             pydantic-settings (env-driven)
 │   ├── db.py                 async engine + session factory
 │   ├── deps.py               current_user, pagination, ownership
 │   ├── api/v1/               chats.py, messages.py, credits.py, webhooks.py
 │   ├── models/               SQLAlchemy models (match contract.prisma)
 │   ├── schemas/              request/response DTOs
-│   ├── services/             agent.py (LangGraph), llm.py, checkpoint.py, billing.py
+│   ├── services/             agent.py (LangGraph), llm.py, checkpoint.py, context.py,
+│   │                         pricing.py, billing.py, chat_locks.py, account.py, payments/
 │   ├── core/                 security.py (Kinde JWKS), exceptions.py
 │   ├── streaming.py          Data Stream Protocol encoder
-│   └── prompts/              plan/build/repair + guardrails
-├── tests/                    pytest suite (64 tests)
+│   └── prompts/              plan/build/repair + guardrails (shipped in the wheel — see below)
+├── tests/                    pytest suite (135 tests)
 ├── alembic/                  migrations (zero-diff baseline only)
+├── Dockerfile                multi-stage: uv build -> slim runtime, node for n8n-mcp
+├── railway.json              Railway builder config (deprecated 2026-12-01)
 ├── _markdown/                SOURCE OF TRUTH — checklist, settled decisions, plans, records
 ├── prototype/                working single-agent prototype (terminal UI, SQLite)
 ├── prompts/                  prototype-only prompt placeholders
 └── notebooks/                prototyping + testcase prompts
 ```
+
+> **`.gitignore` patterns for root-only directories must be anchored** (`/prompts`, not
+> `prompts/`). An unanchored pattern matches at any depth, so `prompts/` also matched
+> `src/app/prompts/` — and because hatchling excludes VCS-ignored paths, production code was
+> silently dropped from the wheel while still looking present in `git`. The `package` CI job
+> now guards this.
 
 ## Source-of-truth docs
 
@@ -185,7 +238,9 @@ Read in this order — they define what's built and why; don't decide divergence
 4. `_markdown/backend-api-schema.md` — the API + streaming contract the frontend codes against.
 
 Implementation records per phase: `_markdown/phase5-implementation.md`,
-`_markdown/phase6-implementation.md`, `_markdown/phase6/` (plans + wire spec).
+`_markdown/phase6-implementation.md`, `_markdown/phase6/` (plans + wire spec),
+`_markdown/phase9/backend-phase9-plan.md` (containerize + CI), and
+`_markdown/phase10-deploy-runbook.md` (first deploy, production incidents, rollback).
 
 ## Guardrails
 
@@ -195,3 +250,6 @@ Implementation records per phase: `_markdown/phase5-implementation.md`,
 - Schema validity ≠ logical correctness — re-read spec vs. workflow before delivery.
 - `users` is Prisma/Next.js-owned; the backend is a **read-only consumer** (401 if the
   User row is missing — a real flow error, never papered over).
+- Never commit `.env`, credentials, or pasted tokens. Debug with `read -rs VAR` on the
+  machine that owns the secret — a token pasted into a transcript can arrive corrupted in a
+  way that manufactures convincing false failures.
