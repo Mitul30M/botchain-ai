@@ -262,10 +262,23 @@ as `ready` (it reads `archived` in older notes) on `ap-southeast-1`, and the bac
 `alembic.ini`/`versions/` and the baseline `3169311c48d2` is already stamped, so **no
 migration step is needed at deploy time**.
 
-### WS9.6 — housekeeping
-- Delete the stray root `main.py` shim (tracked; unused).
-- Update `AGENTS.md` milestone table: mark 8 deferred, 9 done. Record the CI
-  `pytest -m "not db"` decision and the deferred `tests` Neon branch.
+### WS9.6 — housekeeping — ✅ **DONE**
+- Deleted the stray root `main.py` shim (`uv init` leftover, `print("Hello from
+  botchain-ai!")`). Verified unused before deleting: zero references anywhere, and
+  `pyproject.toml`'s hatch config packages only `["src/app"]`, so it was never in the
+  wheel. It was already excluded from the Docker context by the `.dockerignore` allowlist.
+- Corrected `AGENTS.md`: the milestone table claimed Phase 7, 8 **and** 9 were "Not
+  started". Phase 7 was already shipped and merely mislabelled (`TemporaryDirectory` at
+  `services/agent.py:736`, download route at `api/v1/messages.py:545`) — fixed, not
+  overwritten. Phase 8 marked deferred-by-choice, Phase 9 done, Phase 10 deferred with a
+  pointer to the WS9.5 prep notes.
+- Recorded the two decisions Phase 6.6/WS9.4 made: CI runs `pytest -m "not db"` so it
+  stays secret-free, and the `tests` Neon branch is still uncreated (resume criterion
+  stated). Also corrected the "Running / developing" section, which claimed `uv run
+  pytest` uses the `tests` Neon branch — it does not, it resolves to production.
+
+**Gate: MET.** 135 pytest green (132 non-DB), ruff clean, `actionlint` exit 0, no dangling
+references to the deleted shim.
 
 ## Carried from Phase 8 (deliberately deferred)
 Full deferral agreed: no `conftest.py`, no Neon `tests` branch, no route-smoke or

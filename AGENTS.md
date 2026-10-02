@@ -74,7 +74,16 @@ Phase 7 (sandbox/files) done — per-build `TemporaryDirectory` sandbox (torn do
 after the build loop), workflow persisted to `Message.meta` and served via the
 download route with no disk dependency; **95 pytest green, ruff clean.** See
 `_markdown/phase7/backend-phase7-plan.md`.
-next: Phase 8 (tests).
+Phase 8 (tests) **deferred by choice** — the suite is green but there is no `tests`
+Neon branch, so the 3 real-DB checkpoint tests still resolve `DATABASE_URL` to
+**production**; they are marked `db` and excluded from CI.
+Phase 9 (containerize + CI) done — `.dockerignore` allowlist, multi-stage
+`Dockerfile` (image boots `healthy` with a pre-installed `n8n-mcp`, no npm fetch
+per cold start), configurable MCP launch command, and `.github/workflows/ci.yml`
+with lint / no-DB test / linux-amd64 image jobs plus an **inert** guarded Railway
+deploy job. **135 pytest green (132 non-DB), ruff clean, `actionlint` exit 0.**
+See `_markdown/phase9/backend-phase9-plan.md`.
+next: Phase 10 (first Railway deploy) — Phase 8 resumes once the `tests` Neon branch exists.
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -119,10 +128,10 @@ Each phase must be **verified working** before the next begins.
 | 4 | Core routes | `/api/v1/chats` CRUD (soft-delete), `GET/POST messages`, `POST /approve`; `credits.py` + `webhooks.py` empty stubs | Curl smoke per route (mock agent) | Done (all routes smoky green against live Neon: create/list/get/rename, happy+disconnect streams (is_error row persisted), approve 409+round-trip, 404s, soft-delete; ruff + 23 pytest green; disconnect flush is a strongly-referenced fire-and-forget task with logged failures) |
 | 5 | LangGraph flow | Port Plan→Confirm→Build→Validate StateGraph into `services/agent.py`; approval interrupt resumed via `/approve` (replaces terminal `input()`); helpers ported; n8n-mcp stdio tools + node-lookup cache | A `notebooks/testcases.md` prompt runs end-to-end → validated workflow | Done (Easy testcase: Webhook+Slack validated; concurrent-build isolation smoke green; HTTP+Neon DB-persistence e2e green; prompts modularized into `src/app/prompts/`; follow-ups green: per-message `input_tokens`/`output_tokens` from streamed usage, `parent_id` chaining, final workflow as `Attachment` row + download route — 38 pytest) |
 | 6 | Streaming | Message/approve routes return SSE in the AI SDK v7 **Data Stream Protocol** (UI Message Stream, `x-vercel-ai-ui-message-stream: v1`); statuses as transient `data-status` parts; fresh text-part id per segment | `useChat` consumes it with zero config; wire-verified against the installed SDK reader; 51 pytest green | Done (decided DSP over the checklist's Text-Stream-first on evidence — see `_markdown/phase6/backend-phase6-plan.md`; follow-ups: session-release + lock double-release + planner-fallback fixes → 54 green) |
-| 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Not started |
-| 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | Not started |
-| 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for `npx n8n-mcp`); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main) | `docker build` passes locally | Not started |
-| 10 | First deploy (deferred) | Railway deploy + e2e smoke | — | Out of current scope — user runs it |
+| 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Done (`TemporaryDirectory` in `services/agent.py:736`, download route in `api/v1/messages.py:545`, `workflow_json` in `Message.meta`; 95 pytest green at the time) |
+| 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | **Deferred by choice, not blocked.** The suite is green (135 tests) but there is no `tests` Neon branch and no `conftest.py`, so the real-DB tests still resolve `DATABASE_URL` to **production**. Audited in `_markdown/phase9/backend-phase9-plan.md`; resume when the `tests` branch exists |
+| 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for n8n-mcp); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main); `railway.json` | `docker build` passes locally; workflow lints | Done (`.dockerignore` allowlist → 48 files/500 KB context; image ~1.02 GB boots `healthy` on `/health` with pre-installed `n8n-mcp` and no npm fetch; `actionlint` exit 0; deploy job inert behind `RAILWAY_DEPLOY_ENABLED`) |
+| 10 | First deploy (deferred) | Railway deploy + e2e smoke | — | Out of current scope — user runs it. Prep + the four known landmines (CORS/`/health`/`.env`-import/domain) are recorded in `_markdown/phase9/backend-phase9-plan.md` WS9.5 |
 
 ## Settled decisions (do not re-litigate without a reason)
 - **ORM:** SQLAlchemy 2.0 typed async models (NOT SQLModel).
@@ -141,6 +150,12 @@ Each phase must be **verified working** before the next begins.
   is the single owner of user creation, so FastAPI never races it.
 - **DB connection:** direct (non-pooled) `DATABASE_URL` for the app and Alembic.
 - **Tests DB:** a dedicated `tests` Neon branch (stamped head), never the production data.
+  **Not created yet — Phase 8 is deferred.** Until it exists, `tests/test_checkpoint.py`
+  (3 tests) reads `DATABASE_URL`, which resolves to **production**, so it carries
+  `pytestmark = pytest.mark.db` and CI runs `pytest -m "not db"` (132 of 135). This keeps
+  CI completely secret-free; putting the production URL in CI secrets would make every PR
+  write to production. When the branch lands, add a second CI job running `-m db` against
+  it rather than widening the existing one.
 - **Checkpointer:** `AsyncPostgresSaver` on the same `DATABASE_URL`, `setup()` at startup;
   conversation memory uses `Chat.context_summary` (no extra table).
 - **Approval gate:** LangGraph `interrupt()` surfaced through `POST /api/v1/chats/{id}/approve`;
@@ -152,6 +167,12 @@ Each phase must be **verified working** before the next begins.
   2026-09-26 — amends the earlier "text-first" decision; see the Phase 6 plan.)
 - **Sandbox/state:** single Railway replica; sandbox is per-turn scratch; workflow JSON
   persisted to `Message.meta` at the end of each build.
+- **Deploy (WS9.5):** CI-driven `railway up`, gated on `needs: [lint, test, docker]` — the
+  deploy job lives *inside* `ci.yml` because `needs` cannot cross workflow files, and a
+  separate `deploy.yml` could not actually gate on green CI. Inert until Phase 10 flips
+  `RAILWAY_DEPLOY_ENABLED` to `"true"`; `environment: production` holds `RAILWAY_TOKEN`.
+  `railway.json` pins `builder: DOCKERFILE`. Set `CORS_ORIGINS` on Railway — unset means
+  no CORS middleware is added at all, which breaks the browser while `/health` stays green.
 - **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,
   or payment calls yet. Treat every request as free during this phase.
 - **Token pricing → `messages.credits_cost` (record-only):** `services/pricing.py` prices a
@@ -260,7 +281,9 @@ POST   /api/v1/webhooks/...                    stub (payments — Razorpay later
 3. Run API: `uv run uvicorn app.main:app --reload` (reload optional).
 4. Alembic: `uv run alembic revision --autogenerate -m "..."` → confirm diff → `uv run
    alembic upgrade head` (or `stamp head` for the Prisma-created baseline).
-5. Tests: `uv run pytest` (uses the `tests` Neon branch).
+5. Tests: `uv run pytest` (135 tests). `uv run pytest -m "not db"` skips the 3 real-DB
+   checkpoint tests — those still target production, since the `tests` branch does not
+   exist yet, so do not add `-m db` to CI.
 6. End-to-end agent smoke (Phase 5+): feed a prompt from `notebooks/testcases.md` through
    `POST /messages` with Ollama + n8n-mcp running.
 
