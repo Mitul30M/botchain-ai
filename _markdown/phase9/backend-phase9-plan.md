@@ -325,7 +325,7 @@ you choose a real CI test DB.
 
 ---
 
-# Phase 10 — first Railway deploy (in progress)
+# Phase 10 — first Railway deploy — ✅ **DONE**
 
 WS9.5's guard is built and proven; this phase executes it. **Architecture A (CI-driven
 `railway up`) is retained deliberately** — see "Why not Railway's Wait for CI" below.
@@ -349,9 +349,32 @@ WS9.5's guard is built and proven; this phase executes it. **Architecture A (CI-
 - **Autodeploy DISABLED** in Railway service settings. This is the single most important
   manual step: a GitHub-linked service auto-deploys on every push to the linked branch and
   would deploy **regardless of CI**, completely bypassing the gate. With it off, the only
-  path to production is the `needs: [lint, test, docker]` job.
+  path to production is the `needs: [lint, test, package, docker]` job.
+- **Deploy executed.** Run `36977212110` went green end-to-end after two fixes — the Railway
+  CLI is not on `PATH` in a non-login `run:` step (needs `$GITHUB_PATH`), and the
+  `RAILWAY_TOKEN` secret had to be set on the **`production` environment** rather than the
+  repo. An empty-token guard now fails loudly instead of surfacing a generic auth error.
+- **Two production incidents on first boot**, both presenting as an edge `HTTP 502` and both
+  invisible to `/health`. Full write-ups, including why every gate passed them, are in
+  `_markdown/phase10-deploy-runbook.md` → *Production incidents*:
+  1. an unanchored `prompts/` in `.gitignore` made hatchling drop `app/prompts/` from the
+     wheel, so the container crash-looped with `ModuleNotFoundError` **after** a green build;
+  2. Railway injects `PORT=8080` while the domain's target port was `8000`, so the app was
+     healthy and genuinely reachable — just not at the port the edge routed to.
+- **CI guard added** for incident 1, and `deploy` now depends on it. The `package` job asserts
+  every `src/app` subpackage ships in the wheel **and** imports `app.main` from the installed
+  wheel with the source tree off `sys.path`. Proven to fail on a reintroduced bug
+  (`subpackage(s) missing from wheel: app/prompts`); `actionlint` clean.
+- **`verify_token` no longer swallows its failure reason** (`src/app/core/security.py`). It
+  caught `jwt.JWTError` and re-raised a generic 401, which made an issuer/audience mismatch
+  indistinguishable from a bad signature. It now logs the jose error, `alg`, `kid`, the
+  configured issuer beside the token's own `iss`, and the configured audience — never the
+  token. Same 401, same headers; behaviour unchanged.
+- **Verified live.** `https://botchain-ai-production.up.railway.app/health` → `200`, and
+  `GET /api/v1/chats` with a real Kinde token → `200` returning production Neon rows. All
+  11 v1 routes are registered and served.
 
-## Blocker — no valid Railway API token yet
+## Blocker — RESOLVED (no valid Railway API token)
 
 Two tokens were issued and **both were rejected** by Railway's GraphQL API
 (`{"errors":[{"message":"Not Authorized"}]}`, HTTP 200) and by the official CLI v5.63.1
@@ -365,18 +388,32 @@ confirmed reachable, so this is **account-level, not a typo**. Working hypothese
 Neither token was ever wired into CI, so nothing is half-configured.
 
 **Standing rule adopted for this phase: tokens are never pasted into chat.** A token is
-exported into the user's own shell and verified with
-`curl -s https://backboard.railway.com/graphql/v2 -H "Authorization: $RAILWAY_TOKEN" ...`;
-only "valid / not valid" comes back to me. Tokens pasted so far are treated as compromised
+exported into the user's own shell and verified with a `curl` from there; only
+"valid / not valid" comes back to me. Tokens pasted so far are treated as compromised
 and must be revoked.
+
+**Resolution.** Neither hypothesis above was it. A Railway **project** token is
+authenticated with the `Project-Access-Token` header, not `Authorization`, and the query
+selects via `projectToken` — `me` is invalid for a project token. Against `Authorization`
+a perfectly valid token returns `{"errors":[{"message":"Not Authorized"}]}` with HTTP 200,
+which is exactly the misleading signal that made this look like an account-level problem.
+The CLI (`railway v5.63.1`) accepts the same token once passed correctly.
+
+**This rule was subsequently violated, and it cost real time.** A Kinde JWT was pasted
+into the conversation to debug a 401. It arrived corrupted — the payload was mangled while
+the signature stayed byte-identical, so it could never verify. That produced convincing
+false failures and two wrong diagnoses before an independent decoder (jwt.io) read the
+same pasted string cleanly. See the process note in the Phase 10 runbook. The rule was
+right; the fix is `read -rs TOK` on the machine that owns the credential.
+
 
 ## Why not Railway's native "Wait for CI"
 
 Railway can gate auto-deploys on GitHub Actions itself, and our workflow already satisfies
 its requirement (`on: push: branches: [main]`). It was rejected because:
 
-- It gates on **workflow-run conclusions**, not our **three named jobs** — strictly weaker
-  than `needs: [lint, test, docker]`.
+- It gates on **workflow-run conclusions**, not our **four named jobs** — strictly weaker
+  than `needs: [lint, test, package, docker]`.
 - The Railway docs explicitly warn against pairing it with a concurrency group that cancels
   queued runs. Ours sets `cancel-in-progress: true`, so a superseded run is **cancelled**,
   and a cancelled workflow can block a deployment.
@@ -387,16 +424,29 @@ Keeping WS9.5 as built costs one scoped secret; the wait-for-CI footgun costs co
 
 ## Remaining
 
-1. Working project-scoped Railway token → `RAILWAY_TOKEN` secret on the `production` environment.
-2. Confirm **replicas = 1** and region **Southeast Asia** saved in Railway (one-replica is a
-   settled `AGENTS.md` decision; Southeast Asia matches Neon `ap-southeast-1`).
-3. Runtime variables set by hand in Railway as sealed values — never by importing `.env.example`:
-   `DATABASE_URL` (Neon **direct/unpooled**, not `-pooler`), `MISTRAL_API_KEY`,
-   `KINDE_ISSUER_URL`, `CORS_ORIGINS`. `N8N_API_*` may stay empty (core MCP tools work without).
-4. Required reviewer on the `production` environment — **UI only**; the REST API rejects
-   User-type reviewers (`422 App not installed on organization`). Note self-approval is
-   allowed by default (the "prevent self-reviews" setting is opt-in), so a solo owner can
-   gate their own deploy.
-5. Flip `RAILWAY_DEPLOY_ENABLED=true`, push to `main`, watch the deploy job.
-6. Generate the public domain, set `CORS_ORIGINS` to match, redeploy, then smoke a
-   **DB-backed** route (`/api/v1/chats` with a real Kinde token) — `/health` proves nothing.
+Done during Phase 10: the project token, **replicas = 1** + Southeast Asia, sealed
+`DATABASE_URL` / `MISTRAL_API_KEY` / `KINDE_ISSUER_URL`, `RAILWAY_DEPLOY_ENABLED=true`,
+the public domain, and the authenticated DB-backed smoke test (`/api/v1/chats` → `200`).
+
+Still open:
+
+1. **`CORS_ORIGINS` is unset** — the last thing blocking frontend use. Unset means *no* CORS
+   middleware is added at all, so a browser cannot call the API even though every route is
+   healthy. Set it to the frontend origin (plus the backend origin if the UI needs it), then
+   redeploy.
+2. **Rotate the Railway project token.** It has deploy rights on `graceful-creation` and was
+   pasted into a conversation; regenerate, update the `production` environment secret, revoke
+   the old one. The Kinde JWT pasted while debugging was a live session token — revoke by
+   logging out of the Kinde app.
+3. **n8n-mcp telemetry is live in production** and printing an installation ID. Decision is
+   the owner's; opting out needs `"DISABLE_TELEMETRY": "true"` in the *explicit* child env in
+   `src/app/main.py`, because the image-level variable cannot reach it while the child
+   environment is set wholesale.
+4. **Required reviewer on the `production` environment** — UI only; the REST API rejects
+   User-type reviewers (`422 App not installed on organization`). Self-approval is allowed by
+   default ("prevent self-reviews" is opt-in), so a solo owner can gate their own deploy.
+5. **`railway.json` is deprecated.** Config as Code is being replaced by `.railway/railway.ts`;
+   the existing file keeps working until **2026-12-01**, so this is on the clock, not urgent.
+6. **Open follow-up from the first-boot logs:** `n8n-mcp` reported `stdin closed, shutting
+   down...`. Startup completed and the app is healthy, so it was not fatal, but if n8n tool
+   calls fail during a real build, that is the first thing to look at.

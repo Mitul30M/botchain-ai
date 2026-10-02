@@ -83,7 +83,19 @@ per cold start), configurable MCP launch command, and `.github/workflows/ci.yml`
 with lint / no-DB test / linux-amd64 image jobs plus an **inert** guarded Railway
 deploy job. **135 pytest green (132 non-DB), ruff clean, `actionlint` exit 0.**
 See `_markdown/phase9/backend-phase9-plan.md`.
-next: Phase 10 (first Railway deploy) — Phase 8 resumes once the `tests` Neon branch exists.
+**Phase 10 (first Railway deploy) done.** Live at
+`https://botchain-ai-production.up.railway.app` (target port **8080** — Railway injects
+`PORT=8080`, so the domain's target port must match that, not the Dockerfile default).
+Verified: `/health` → 200 and `GET /api/v1/chats` with a real Kinde token → **200** against
+production Neon. Two first-boot incidents, both presenting as an opaque edge `HTTP 502` and
+both invisible to `/health`, are written up in `_markdown/phase10-deploy-runbook.md` →
+*Production incidents*: an unanchored `prompts/` in `.gitignore` made hatchling drop
+`app/prompts/` from the wheel (fixed, and now guarded by a `package` CI job that asserts
+wheel contents and imports `app.main` from the installed wheel); and the port mismatch above.
+`verify_token` now logs why verification failed instead of swallowing it.
+**Still open:** `CORS_ORIGINS` unset (blocks the browser, not the API); rotate the Railway
+project token; n8n-mcp telemetry is live in production (owner's call).
+next: frontend wiring. Phase 8 resumes once the `tests` Neon branch exists.
 
 ## Read first — source of truth (in this order)
 1. `_markdown/python-fastapi-backendchecklist.md` — the 10-phase build checklist AND the
@@ -131,7 +143,7 @@ Each phase must be **verified working** before the next begins.
 | 7 | Sandbox/files | Per-turn `tempfile` sandbox (ephemeral — Railway disk doesn't survive); final workflow JSON persisted to `Message.meta` | Workflow survives request via DB, not disk | Done (`TemporaryDirectory` in `services/agent.py:736`, download route in `api/v1/messages.py:545`, `workflow_json` in `Message.meta`; 95 pytest green at the time) |
 | 8 | Tests | `conftest.py` on `tests` Neon branch; unit tests (helpers, approval transitions, auth, spec-completeness); one smoke per route; graph-fixture with fake n8n tools | `pytest` green | **Deferred by choice, not blocked.** The suite is green (135 tests) but there is no `tests` Neon branch and no `conftest.py`, so the real-DB tests still resolve `DATABASE_URL` to **production**. Audited in `_markdown/phase9/backend-phase9-plan.md`; resume when the `tests` branch exists |
 | 9 | Containerize + CI | Multi-stage `Dockerfile` (uv build → slim runtime, node for n8n-mcp); `.github/workflows/ci.yml` (ruff + pytest + docker build on PR; guarded deploy on main); `railway.json` | `docker build` passes locally; workflow lints | Done (`.dockerignore` allowlist → 48 files/500 KB context; image ~1.02 GB boots `healthy` on `/health` with pre-installed `n8n-mcp` and no npm fetch; `actionlint` exit 0; deploy job inert behind `RAILWAY_DEPLOY_ENABLED`) |
-| 10 | First deploy (deferred) | Railway deploy + e2e smoke | — | Out of current scope — user runs it. Prep + the four known landmines (CORS/`/health`/`.env`-import/domain) are recorded in `_markdown/phase9/backend-phase9-plan.md` WS9.5 |
+| 10 | First deploy (deferred) | Railway deploy + e2e smoke | — | **Done.** Deployed via the gated CI job; `/health` 200 and authenticated `GET /api/v1/chats` 200 against production Neon. Two first-boot incidents (wheel missing `app/prompts`; port 8080 vs 8000) written up in `_markdown/phase10-deploy-runbook.md`; the packaging one now has a CI guard |
 
 ## Settled decisions (do not re-litigate without a reason)
 - **ORM:** SQLAlchemy 2.0 typed async models (NOT SQLModel).
@@ -167,12 +179,17 @@ Each phase must be **verified working** before the next begins.
   2026-09-26 — amends the earlier "text-first" decision; see the Phase 6 plan.)
 - **Sandbox/state:** single Railway replica; sandbox is per-turn scratch; workflow JSON
   persisted to `Message.meta` at the end of each build.
-- **Deploy (WS9.5):** CI-driven `railway up`, gated on `needs: [lint, test, docker]` — the
-  deploy job lives *inside* `ci.yml` because `needs` cannot cross workflow files, and a
-  separate `deploy.yml` could not actually gate on green CI. Inert until Phase 10 flips
-  `RAILWAY_DEPLOY_ENABLED` to `"true"`; `environment: production` holds `RAILWAY_TOKEN`.
-  `railway.json` pins `builder: DOCKERFILE`. Set `CORS_ORIGINS` on Railway — unset means
-  no CORS middleware is added at all, which breaks the browser while `/health` stays green.
+- **Deploy (WS9.5):** CI-driven `railway up`, gated on `needs: [lint, test, package, docker]`
+  — the `package` job asserts every `src/app` subpackage ships in the wheel and imports
+  `app.main` from the **installed** wheel, because pytest (imports the `src` tree) and
+  `docker build` (imports nothing) both miss a broken wheel; the deploy job lives *inside* `ci.yml` because `needs` cannot cross workflow files, and a
+  separate `deploy.yml` could not actually gate on green CI. Phase 10 has since flipped
+  `RAILWAY_DEPLOY_ENABLED` to `"true"` — the gate is live and armed.
+  `environment: production` holds `RAILWAY_TOKEN`; Railway **autodeploy stays disabled**, or
+  a GitHub push would deploy without passing CI. `railway.json` pins `builder: DOCKERFILE`
+  (deprecated — Config as Code gives way to `.railway/railway.ts` on 2026-12-01).
+  `CORS_ORIGINS` is still unset on Railway — unset means no CORS middleware is added at
+  all, which breaks the browser while `/health` stays green.
 - **Billing:** `credits.py`/`webhooks.py` are empty stubs — no balance checks, deductions,
   or payment calls yet. Treat every request as free during this phase.
 - **Token pricing → `messages.credits_cost` (record-only):** `services/pricing.py` prices a

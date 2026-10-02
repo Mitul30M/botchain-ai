@@ -56,6 +56,53 @@ jobs:
       - name: Run test suite
         run: uv run pytest -m "not db" -v
 
+  # Phase 10 incident guard. An unanchored `prompts/` in .gitignore made hatchling
+  # drop src/app/prompts/ from the wheel: the files stayed git-tracked (gitignore
+  # never affects tracked files, so `git ls-files src/app/prompts/` looked healthy)
+  # but the build backend excludes VCS-ignored paths. Nothing caught it — pytest
+  # imports from the src tree and `docker build` never imports anything — so the
+  # image built green and crash-looped on first boot with ModuleNotFoundError.
+  #
+  # Two independent checks, because either alone is insufficient:
+  #   1. every subpackage under src/app is present in the wheel, which catches an
+  #      omission the import graph never happens to reach;
+  #   2. app.main imports from the INSTALLED wheel with the source tree off
+  #      sys.path — the same path uvicorn takes in production.
+  package:
+    name: Package (wheel import)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv build --wheel --out-dir /tmp/wheel
+      - name: Assert every source subpackage ships in the wheel
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, zipfile
+
+          wheel = next(pathlib.Path("/tmp/wheel").glob("*.whl"))
+          shipped = set(zipfile.ZipFile(wheel).namelist())
+          missing = []
+          for init in pathlib.Path("src/app").rglob("__init__.py"):
+              pkg = init.parent.relative_to("src").as_posix()
+              if f"{pkg}/__init__.py" not in shipped:
+                  missing.append(pkg)
+          if missing:
+              sys.exit("subpackage(s) missing from wheel: " + ", ".join(sorted(missing)))
+          print(f"OK {wheel.name}: all subpackages shipped")
+          PY
+      # `cd /tmp` keeps the repo root off sys.path. Importing from the source tree
+      # would pass even against a broken wheel, which is precisely the failure this
+      # job exists to catch.
+      - name: Import the installed wheel, source tree off sys.path
+        run: |
+          uv venv /tmp/verify
+          VIRTUAL_ENV=/tmp/verify uv pip install /tmp/wheel/*.whl
+          cd /tmp
+          /tmp/verify/bin/python -c "import app.main; print('OK app.main,', len(app.main.app.routes), 'routes')"
+
   docker:
     name: Image (docker build)
     runs-on: ubuntu-latest
@@ -78,7 +125,7 @@ jobs:
   # actually gate on CI being green — the real guard this phase asks for.
   deploy:
     name: Deploy (Railway)
-    needs: [lint, test, docker]
+    needs: [lint, test, package, docker]
     # Inert until Phase 10: flip the RAILWAY_DEPLOY_ENABLED repository variable to
     # "true". Both conditions keep it off PRs and off main until then. A skipped
     # job does not fail the run, so this costs nothing while disabled.
