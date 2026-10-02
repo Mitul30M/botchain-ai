@@ -190,8 +190,11 @@ Two things to know before touching the deploy config:
 - **The domain's target port must be `8080`.** Railway injects `PORT=8080` and the `CMD`
   honors it (`--port ${PORT:-8000}`), so uvicorn binds 8080. Pointing the domain at 8000
   produces an edge `502` from a perfectly healthy container.
-- **`CORS_ORIGINS` is still unset**, which means *no* CORS middleware is added at all. The
-  API is healthy, but a browser cannot call it. Set it to the frontend origin, then redeploy.
+- **`CORS_ORIGINS` is unset**, so no CORS middleware is installed. That is *correct* for the
+  current frontend: it proxies every backend call server-side (all four files touching
+  `BACKEND_URL` are route handlers or server code, with no `NEXT_PUBLIC_*` anywhere), so the
+  browser never calls FastAPI and CORS never applies. Set it only if something ever calls
+  the API directly from a browser.
 
 Full first-deploy procedure, both production incidents (and why each passed every gate), and
 the rollback/stop-the-line steps: **`_markdown/phase10-deploy-runbook.md`**.

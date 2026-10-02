@@ -93,8 +93,11 @@ both invisible to `/health`, are written up in `_markdown/phase10-deploy-runbook
 `app/prompts/` from the wheel (fixed, and now guarded by a `package` CI job that asserts
 wheel contents and imports `app.main` from the installed wheel); and the port mismatch above.
 `verify_token` now logs why verification failed instead of swallowing it.
-**Still open:** `CORS_ORIGINS` unset (blocks the browser, not the API); rotate the Railway
-project token; n8n-mcp telemetry is live in production (owner's call).
+**Still open:** rotate the Railway project token (it was pasted in chat, and it now governs
+the frontend service too); n8n-mcp telemetry is live in production (owner's call).
+`CORS_ORIGINS` is unset and that is **not** a blocker — the Next.js frontend proxies every
+backend call server-side, so the browser never calls FastAPI. CORS would only matter if
+something called this API directly from a browser.
 next: frontend wiring. Phase 8 resumes once the `tests` Neon branch exists.
 
 ## Read first — source of truth (in this order)
@@ -318,9 +321,16 @@ without surprises at wiring time (frontend↔backend wiring is frontend-phase wo
 only after this backend repo is in good shape).
 
 - Frontend: Next.js 16 App Router, **Kinde hosted auth**, Prisma 8 contract mode → Neon;
-  `pnpm` only (ours is `uv`). It is at its own Phase 3 (chat UI shell — mock cards and
-  skeletons, **no API calls yet**). Its live `src/prisma/contract.prisma` was verified
-  byte-identical to the copy in `_nextjs_repo_context/`.
+  `pnpm` only (ours is `uv`). Backend wiring is **done and committed** (streaming, approval,
+  attachments, rename/delete, account purge) — every request body it sends matches these
+  schemas exactly, and it creates chats *through this backend* so `Chat.model` stays correct.
+  It proxies every backend call **server-side**, so CORS is irrelevant. **Deploy plan (not yet
+  executed): `_markdown/frontend-deploy-plan.md`** — Railway as a stateful Node server
+  (deliberately not Vercel: its 300s function ceiling would truncate multi-minute agent
+  builds), needing `output: "standalone"`, a Dockerfile, and Neon pooler + auto-suspend
+  (`suspend_timeout_seconds` is currently `0`, so the DB bills 24/7 even while paused).
+  Its live `src/prisma/contract.prisma` was verified byte-identical to the copy in
+  `_nextjs_repo_context/`.
 - User-facing identifier is the **local `User.id`** (Postgres UUID), not `kindeId`.
   Frontend routes are `/users/{User.id}/…` and its layout resolves `kindeId` → local
   User (redirects on mismatch). Use `User.id` in all backend payloads.
