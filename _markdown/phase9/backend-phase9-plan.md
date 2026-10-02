@@ -184,7 +184,7 @@ product/policy decision for the repo owner, not a containerisation detail. Flagg
 than decided. Note the same allowlist means *any* future MCP env var must be added there
 too, or it will silently not arrive.
 
-### WS9.4 — CI on pull requests — ✅ **DONE** *(not yet run on GitHub — see gate)*
+### WS9.4 — CI on pull requests — ✅ **DONE** *(verified green on real GitHub runners)*
 `.github/workflows/ci.yml`, three independent jobs (parallel, not sequential, for faster
 PR feedback) triggered on `pull_request` **and** pushes to `main`, so the branch WS9.5
 deploys from is always verified. `concurrency` cancels superseded runs.
@@ -195,10 +195,16 @@ deploys from is always verified. `concurrency` cancels superseded runs.
 | `test` | `pytest -m "not db" -v` | **secret-free** — see below |
 | `docker` | `docker/build-push-action` build | `platforms: linux/amd64`, gha layer cache |
 
-- **Action versions verified, not guessed.** `astral-sh/setup-uv` is at **v10**,
+- **Action versions pinned, and the pin was earned the hard way.** `actions/checkout` **v7**,
   `docker/build-push-action` **v7**, `docker/setup-buildx-action` **v4**,
-  `actions/checkout` **v7** (queried the GitHub API; v5/v6 for setup-uv would have
-  been stale by several majors).
+  `astral-sh/setup-uv` **v10.2.0**.
+  The first real run failed with `Unable to resolve action astral-sh/setup-uv@v10,
+  unable to find version v10` — setup-uv's **v10 line publishes no floating `@v10` tag**,
+  so a floating major that looks current is unresolvable. **Pinned to exact `v10.2.0`.**
+  `actionlint` cannot catch this: it does not resolve action refs over the network, so a
+  syntactically valid, nonexistent ref passes lint and only fails on a real runner. Every
+  non-comment action ref in `ci.yml` was subsequently verified to return HTTP 200 against
+  the GitHub API, and that check is recorded as a comment in the workflow.
 - **The amd64 pin is deliberate.** Local builds only exercise arm64, so CI is the only
   place the Railway target architecture gets built.
 - **Test DB: `pytest -m "not db"`.** `tests/test_checkpoint.py` is the only suite touching a
@@ -207,9 +213,20 @@ deploys from is always verified. `concurrency` cancels superseded runs.
   Declared a `db` marker in `pyproject.toml` and applied it to that file (the smallest
   useful slice of Phase 8). Verified the split is exactly 3 / 132 with **zero**
   unknown-marker warnings.
-- **Gate: PARTIALLY MET — cannot self-verify.** `actionlint` passes clean (exit 0) and both
-  commands were run locally, but "CI green on a real PR" needs a push to GitHub, which is
-  the user's action. Everything up to that push is verified.
+- **Gate: MET.** `actionlint` clean (exit 0) locally, and the first real push proved it end
+  to end on GitHub-hosted runners. Run **`36969637517`** on `main` (after the setup-uv pin,
+  commit `811ffc5`) is **fully green**:
+
+  | Job | Conclusion |
+  |---|---|
+  | `Lint (ruff)` | ✅ success |
+  | `Test (pytest, no database)` | ✅ success |
+  | `Image (docker build)` | ✅ success — `linux/amd64`, the Railway target, built on a real runner |
+  | `Deploy (Railway)` | ⏭️ skipped — correct, `RAILWAY_DEPLOY_ENABLED` is unset |
+
+  The preceding run **`36969318018`** is the useful negative result: `docker` passed while
+  `lint`/`test` failed on the bad ref, and the deploy job skipped rather than firing on a
+  partially-green pipeline. **The gate behaves as designed.**
 
 ### WS9.5 — guarded deploy on `main` — ✅ **DONE** *(inert until Phase 10)*
 Config only; the first real deploy stays in Phase 10.
@@ -305,3 +322,81 @@ you choose a real CI test DB.
 - Boot with a cleared npm cache to prove R2 is actually retired.
 - `docker images` size recorded in this doc as the baseline.
 - CI green on a throwaway PR, with **no** secrets configured.
+
+---
+
+# Phase 10 — first Railway deploy (in progress)
+
+WS9.5's guard is built and proven; this phase executes it. **Architecture A (CI-driven
+`railway up`) is retained deliberately** — see "Why not Railway's Wait for CI" below.
+
+## Completed
+
+- **Default branch renamed `master` → `main`.** CI and the WS9.5 deploy gate both key on
+  `main`, so this was a prerequisite. Pushed `origin/main`, GitHub default updated.
+  `origin/master` still exists and is now unused — safe to delete, left alone deliberately.
+- **First real CI run** `36969318018` — `docker` ✅ / `lint` ❌ `test` ❌ on the `setup-uv@v10`
+  ref. Deploy job correctly **skipped** rather than firing on a half-green pipeline.
+- **setup-uv pinned** to `v10.2.0` (commit `811ffc5`); re-run **`36969637517` fully green**.
+  WS9.4's gate is now genuinely met — see its section above.
+- **Railway project + service created**, GitHub repo connected as the source.
+- **GitHub `production` environment created** (`gh api -X PUT .../environments/production`).
+  This is what scopes `RAILWAY_TOKEN`, so the deploy token is *not* readable from PRs or from
+  anyone without access to that environment.
+- **Repository variables set:** `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE`.
+  `RAILWAY_DEPLOY_ENABLED` is deliberately **still unset** — the deploy stays inert until a
+  working token exists, so a stray push cannot deploy.
+- **Autodeploy DISABLED** in Railway service settings. This is the single most important
+  manual step: a GitHub-linked service auto-deploys on every push to the linked branch and
+  would deploy **regardless of CI**, completely bypassing the gate. With it off, the only
+  path to production is the `needs: [lint, test, docker]` job.
+
+## Blocker — no valid Railway API token yet
+
+Two tokens were issued and **both were rejected** by Railway's GraphQL API
+(`{"errors":[{"message":"Not Authorized"}]}`, HTTP 200) and by the official CLI v5.63.1
+(`railway whoami` → `Unauthorized`). Both were well-formed 36-char UUIDs, and the API was
+confirmed reachable, so this is **account-level, not a typo**. Working hypotheses:
+
+1. **Unverified account email** — most likely. Railway does not activate API tokens until the
+   account email is verified, which fails every token identically.
+2. The token *name/ID* was copied instead of the secret value.
+
+Neither token was ever wired into CI, so nothing is half-configured.
+
+**Standing rule adopted for this phase: tokens are never pasted into chat.** A token is
+exported into the user's own shell and verified with
+`curl -s https://backboard.railway.com/graphql/v2 -H "Authorization: $RAILWAY_TOKEN" ...`;
+only "valid / not valid" comes back to me. Tokens pasted so far are treated as compromised
+and must be revoked.
+
+## Why not Railway's native "Wait for CI"
+
+Railway can gate auto-deploys on GitHub Actions itself, and our workflow already satisfies
+its requirement (`on: push: branches: [main]`). It was rejected because:
+
+- It gates on **workflow-run conclusions**, not our **three named jobs** — strictly weaker
+  than `needs: [lint, test, docker]`.
+- The Railway docs explicitly warn against pairing it with a concurrency group that cancels
+  queued runs. Ours sets `cancel-in-progress: true`, so a superseded run is **cancelled**,
+  and a cancelled workflow can block a deployment.
+- It gives up the `environment: production` human-approval gate and needs **no** Railway
+  token in GitHub at all.
+
+Keeping WS9.5 as built costs one scoped secret; the wait-for-CI footgun costs correctness.
+
+## Remaining
+
+1. Working project-scoped Railway token → `RAILWAY_TOKEN` secret on the `production` environment.
+2. Confirm **replicas = 1** and region **Southeast Asia** saved in Railway (one-replica is a
+   settled `AGENTS.md` decision; Southeast Asia matches Neon `ap-southeast-1`).
+3. Runtime variables set by hand in Railway as sealed values — never by importing `.env.example`:
+   `DATABASE_URL` (Neon **direct/unpooled**, not `-pooler`), `MISTRAL_API_KEY`,
+   `KINDE_ISSUER_URL`, `CORS_ORIGINS`. `N8N_API_*` may stay empty (core MCP tools work without).
+4. Required reviewer on the `production` environment — **UI only**; the REST API rejects
+   User-type reviewers (`422 App not installed on organization`). Note self-approval is
+   allowed by default (the "prevent self-reviews" setting is opt-in), so a solo owner can
+   gate their own deploy.
+5. Flip `RAILWAY_DEPLOY_ENABLED=true`, push to `main`, watch the deploy job.
+6. Generate the public domain, set `CORS_ORIGINS` to match, redeploy, then smoke a
+   **DB-backed** route (`/api/v1/chats` with a real Kinde token) — `/health` proves nothing.
